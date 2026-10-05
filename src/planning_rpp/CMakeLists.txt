@@ -9,7 +9,7 @@ install(
 )
 
 install(
-  PROGRAMS scripts/go_letters
+  PROGRAMS scripts/go_letters scripts/stiction_boost
   DESTINATION lib/${PROJECT_NAME}
 )
 

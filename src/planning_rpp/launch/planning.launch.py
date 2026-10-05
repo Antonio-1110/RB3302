@@ -5,6 +5,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
+from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
 
 
@@ -25,6 +26,7 @@ def generate_launch_description():
     raw_odom_topic = LaunchConfiguration('raw_odom_topic')
     imu_topic = LaunchConfiguration('imu_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
+    stiction_boost = LaunchConfiguration('stiction_boost')
     set_initial_pose = LaunchConfiguration('set_initial_pose')
     initial_pose_x = LaunchConfiguration('initial_pose_x')
     initial_pose_y = LaunchConfiguration('initial_pose_y')
@@ -82,6 +84,9 @@ def generate_launch_description():
         DeclareLaunchArgument('raw_odom_topic', default_value='/odom/raw'),
         DeclareLaunchArgument('imu_topic', default_value='/imu_data_ros'),
         DeclareLaunchArgument('cmd_vel_topic', default_value='/cmd_vel'),
+        DeclareLaunchArgument(
+            'stiction_boost', default_value='true',
+            description='Boost stalled in-place turns (false = pass-through)'),
         DeclareLaunchArgument('set_initial_pose', default_value='false'),
         DeclareLaunchArgument('initial_pose_x', default_value='0.0'),
         DeclareLaunchArgument('initial_pose_y', default_value='0.0'),
@@ -216,7 +221,22 @@ def generate_launch_description():
             parameters=[configured_params],
             remappings=[
                 ('cmd_vel', 'cmd_vel_nav_raw'),
-                ('cmd_vel_smoothed', cmd_vel_topic),
+                ('cmd_vel_smoothed', 'cmd_vel_nav_smoothed'),
+            ],
+        ),
+        Node(
+            package='planning_rpp',
+            executable='stiction_boost',
+            name='stiction_boost',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'enabled': ParameterValue(stiction_boost, value_type=bool),
+            }],
+            remappings=[
+                ('cmd_vel_smoothed', 'cmd_vel_nav_smoothed'),
+                ('cmd_vel', cmd_vel_topic),
+                ('odom', odom_topic),
             ],
         ),
         Node(
