@@ -128,4 +128,3 @@ Start planning:
 ```bash
 ros2 launch planning_rpp planning.launch.py
 ```
-# RB3302
