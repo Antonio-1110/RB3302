@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Drive to lettered squares of the 4x6 obstacle course and wait at each.
+
+Usage:
+    ros2 run planning_rpp go_letters A H O X
+    ros2 run planning_rpp go_letters --start S NE A H O X
+    ros2 run planning_rpp go_letters --start S NE        # only set the pose
+
+--start S0 B0 sets AMCL's initial pose (replacing RViz's 2D Pose Estimate)
+to the centre of square S0 facing bearing B0, one of
+N NE E SE S SW W NW (course directions, N = towards row A-F).
+
+Squares are 60 cm cubes laid out as:
+
+    A B C D E F     (north)
+    G H I J K L
+    M N O P Q R
+    S T U V W X     (south)
+
+Centres are expressed in the 'arena' frame (origin at the SW inner corner,
+X = East, Y = North) published by planning.launch.py, transformed into the
+map frame, and sent as one FollowWaypoints goal. The pause at each square is
+waypoint_follower's wait_at_waypoint.waypoint_pause_duration.
+"""
+import math
+import sys
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.utilities import remove_ros_args
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from nav2_msgs.action import FollowWaypoints
+from std_srvs.srv import Empty
+from tf2_ros import Buffer, TransformListener
+
+CELL_SIZE = 0.6
+ROWS = ['ABCDEF', 'GHIJKL', 'MNOPQR', 'STUVWX']  # north to south
+ARENA_FRAME = 'arena'
+MAP_FRAME = 'map'
+# Arena yaw (X = East) of each course bearing.
+BEARINGS = {
+    'E': 0.0, 'NE': 45.0, 'N': 90.0, 'NW': 135.0,
+    'W': 180.0, 'SW': -135.0, 'S': -90.0, 'SE': -45.0,
+}
+# Start pose uncertainty handed to AMCL: the robot is roughly at the square
+# centre and the bearing is approximate (+-22.5 deg to the next bearing).
+START_XY_STDDEV = 0.10
+START_YAW_STDDEV = math.radians(22.5)
+NOMOTION_UPDATES = 20
+
+
+def letter_to_arena(letter):
+    """Return the (x, y) centre of a square in the arena frame."""
+    for i, row in enumerate(ROWS):
+        col = row.find(letter)
+        if col >= 0:
+            return ((col + 0.5) * CELL_SIZE,
+                    (len(ROWS) - 1 - i + 0.5) * CELL_SIZE)
+    raise ValueError(f'unknown square {letter!r}; use A-X')
+
+
+def bearing_to_arena(bearing):
+    """Return the arena-frame yaw (radians) of a course bearing."""
+    if bearing not in BEARINGS:
+        raise ValueError(
+            f'unknown bearing {bearing!r}; use one of {" ".join(BEARINGS)}')
+    return math.radians(BEARINGS[bearing])
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+class GoLetters(Node):
+
+    def __init__(self):
+        super().__init__('go_letters')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.client = ActionClient(self, FollowWaypoints, 'follow_waypoints')
+        self.initial_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped, 'initialpose', 10)
+        self.nomotion_client = self.create_client(
+            Empty, 'request_nomotion_update')
+
+    def arena_to_map(self):
+        """Wait for map->arena and return (tx, ty, yaw) of arena in map."""
+        deadline = self.get_clock().now() + Duration(seconds=10.0)
+        while rclpy.ok():
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    MAP_FRAME, ARENA_FRAME, Time())
+                return (t.transform.translation.x, t.transform.translation.y,
+                        yaw_of(t.transform.rotation))
+            except Exception as e:  # noqa: BLE001 - keep waiting for TF
+                if self.get_clock().now() > deadline:
+                    raise RuntimeError(
+                        f'no {MAP_FRAME}->{ARENA_FRAME} transform; '
+                        'is planning.launch.py running?') from e
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+    @staticmethod
+    def to_map(arena_tf, x, y):
+        tx, ty, a = arena_tf
+        return (tx + x * math.cos(a) - y * math.sin(a),
+                ty + x * math.sin(a) + y * math.cos(a))
+
+    def set_start(self, square, bearing):
+        """Give AMCL the start pose, then let it settle on the scan."""
+        arena_tf = self.arena_to_map()
+        x, y = self.to_map(arena_tf, *letter_to_arena(square))
+        yaw = bearing_to_arena(bearing) + arena_tf[2]
+
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = MAP_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        msg.pose.covariance[0] = START_XY_STDDEV ** 2
+        msg.pose.covariance[7] = START_XY_STDDEV ** 2
+        msg.pose.covariance[35] = START_YAW_STDDEV ** 2
+
+        deadline = self.get_clock().now() + Duration(seconds=10.0)
+        while self.initial_pose_pub.get_subscription_count() == 0:
+            if self.get_clock().now() > deadline:
+                raise RuntimeError('AMCL is not subscribed to /initialpose')
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.initial_pose_pub.publish(msg)
+        self.get_logger().info(
+            f'start pose: {square} facing {bearing} -> map ({x:.2f}, {y:.2f}, '
+            f'yaw {math.degrees(yaw):.0f} deg)')
+
+        # AMCL normally only updates after the robot moves; force a few scan
+        # updates so the approximate bearing is refined before driving.
+        if not self.nomotion_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(
+                'request_nomotion_update unavailable; AMCL will refine the '
+                'pose once the robot moves')
+            return
+        for _ in range(NOMOTION_UPDATES):
+            future = self.nomotion_client.call_async(Empty.Request())
+            rclpy.spin_until_future_complete(self, future)
+            end = self.get_clock().now() + Duration(seconds=0.1)
+            while self.get_clock().now() < end:
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+    def build_poses(self, letters):
+        arena_tf = self.arena_to_map()
+        points = [self.to_map(arena_tf, *letter_to_arena(letter))
+                  for letter in letters]
+
+        poses = []
+        heading = 0.0
+        for i, (x, y) in enumerate(points):
+            # Face the next square so the robot leaves without spinning; the
+            # last square keeps the heading it arrived with.
+            if i + 1 < len(points):
+                nx, ny = points[i + 1]
+                if (nx, ny) != (x, y):
+                    heading = math.atan2(ny - y, nx - x)
+            elif i > 0:
+                px, py = points[i - 1]
+                if (px, py) != (x, y):
+                    heading = math.atan2(y - py, x - px)
+            pose = PoseStamped()
+            pose.header.frame_id = MAP_FRAME
+            pose.header.stamp = self.get_clock().now().to_msg()
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.orientation.z = math.sin(heading / 2.0)
+            pose.pose.orientation.w = math.cos(heading / 2.0)
+            poses.append(pose)
+        return poses
+
+    def run(self, letters):
+        poses = self.build_poses(letters)
+        for letter, p in zip(letters, poses):
+            self.get_logger().info(
+                f'{letter}: map ({p.pose.position.x:.2f}, '
+                f'{p.pose.position.y:.2f})')
+
+        if not self.client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error('follow_waypoints action not available')
+            return False
+
+        goal = FollowWaypoints.Goal()
+        goal.poses = poses
+
+        def on_feedback(msg):
+            i = msg.feedback.current_waypoint
+            if 0 <= i < len(letters):
+                self.get_logger().info(f'heading to {letters[i]}',
+                                       throttle_duration_sec=2.0)
+
+        send = self.client.send_goal_async(goal, feedback_callback=on_feedback)
+        rclpy.spin_until_future_complete(self, send)
+        handle = send.result()
+        if not handle.accepted:
+            self.get_logger().error('waypoint goal rejected')
+            return False
+
+        done = handle.get_result_async()
+        rclpy.spin_until_future_complete(self, done)
+        missed = list(done.result().result.missed_waypoints)
+        if missed:
+            idx = [getattr(m, 'index', m) for m in missed]
+            self.get_logger().warn(
+                'missed: ' + ' '.join(letters[i] for i in idx))
+            return False
+        self.get_logger().info('all squares reached')
+        return True
+
+
+def main():
+    argv = remove_ros_args(sys.argv)[1:]
+    start = None
+    if argv and argv[0] == '--start':
+        if len(argv) < 3:
+            print('--start needs a square and a bearing, e.g. --start S NE')
+            return 1
+        start = (argv[1].upper(), argv[2].upper())
+        argv = argv[3:]
+    letters = [c.upper() for arg in argv for c in arg if not c.isspace()]
+    if not letters and start is None:
+        print(__doc__)
+        return 1
+    try:
+        for letter in letters:
+            letter_to_arena(letter)
+        if start is not None:
+            letter_to_arena(start[0])
+            bearing_to_arena(start[1])
+    except ValueError as e:
+        print(e)
+        return 1
+
+    rclpy.init()
+    node = GoLetters()
+    try:
+        ok = True
+        if start is not None:
+            node.set_start(*start)
+        if letters:
+            ok = node.run(letters)
+    except (RuntimeError, KeyboardInterrupt) as e:
+        node.get_logger().error(str(e) or 'interrupted')
+        ok = False
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
