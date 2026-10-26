@@ -11,6 +11,14 @@ amcl:
     alpha3: 0.2
     alpha4: 0.2
     alpha5: 0.2
+    # Tuned on the robot: a large particle pool for the loose start pose
+    # (+-0.15 m, +-45 deg) and frequent scan corrections (every 5 cm / ~6 deg)
+    # for the tight goal tolerance.
+    # Reduced from 2000/3000 to ease CPU load on the robot.
+    min_particles: 1500
+    max_particles: 2500
+    update_min_d: 0.05
+    update_min_a: 0.1
 
 bt_navigator:
   ros__parameters:
@@ -35,14 +43,19 @@ controller_server:
       plugin: nav2_controller::SimpleProgressChecker
     goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
-      xy_goal_tolerance: 0.1
+      # A 0.31 m robot stays fully inside a 0.6 m square up to ~0.145 m off
+      # centre. 0.05 m is about as tight as AMCL's ~2-3 cm pose noise allows;
+      # tighter makes the robot creep/oscillate at the goal.
+      xy_goal_tolerance: 0.05
       yaw_goal_tolerance: 3.14   # heading at squares does not matter
     FollowPath:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       desired_linear_vel: 0.2
-      lookahead_dist: 0.35
-      min_lookahead_dist: 0.25
-      max_lookahead_dist: 0.5
+      # Short lookahead: RPP steers at a point this far along the path, so a
+      # long one cuts the inside of corners. Raise if it weaves on straights.
+      lookahead_dist: 0.25
+      min_lookahead_dist: 0.2
+      max_lookahead_dist: 0.35
       lookahead_time: 1.5
       rotate_to_heading_angular_vel: 1.5
       transform_tolerance: 0.1
@@ -52,12 +65,20 @@ controller_server:
       use_collision_detection: true
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
+      # Never slow down near walls: they are avoided by planning down the
+      # centre (Smac 2D), tracking that path, and wall_repulsion steering.
       use_cost_regulated_linear_velocity_scaling: false
-      regulated_linear_scaling_min_radius: 0.3
-      regulated_linear_scaling_min_speed: 0.1
+      # Slow down on bends tighter than this radius (corners), so turns are
+      # tracked closely instead of swinging wide.
+      regulated_linear_scaling_min_radius: 0.6
+      # Floor for all of RPP's slowdowns: below ~0.1 m/s the skid-steer base
+      # may not move at all. Raise if it still stalls near walls.
+      regulated_linear_scaling_min_speed: 0.12
       allow_reversing: false
       use_rotate_to_heading: true
-      rotate_to_heading_min_angle: 0.785
+      # Skid-steer pivots far better than it curves: turn on the spot to
+      # face the path whenever it is more than ~29 deg off.
+      rotate_to_heading_min_angle: 0.5
       max_angular_accel: 3.2
 
 local_costmap:
@@ -82,6 +103,11 @@ local_costmap:
           marking: true
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
+        # Course corridors are ~0.6 m wide, so a centred robot is ~0.3 m from
+        # each wall. Cost starts at the footprint edge (0.15 m) and fades out
+        # by 0.35 m, so planned paths are pushed to the middle of corridors.
+        inflation_radius: 0.35
+        cost_scaling_factor: 6.0
       always_send_full_costmap: true
 
 global_costmap:
@@ -107,6 +133,11 @@ global_costmap:
           marking: true
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
+        # Course corridors are ~0.6 m wide, so a centred robot is ~0.3 m from
+        # each wall. Cost starts at the footprint edge (0.15 m) and fades out
+        # by 0.35 m, so planned paths are pushed to the middle of corridors.
+        inflation_radius: 0.35
+        cost_scaling_factor: 6.0
       always_send_full_costmap: true
 
 map_server:
@@ -118,9 +149,29 @@ planner_server:
   ros__parameters:
     use_sim_time: false
     planner_plugins: ["GridBased"]
+    # Smac 2D: A* on the costmap grid, like NavFn, but it weighs the
+    # inflation cost much more strongly, so paths run down the middle of the
+    # corridors instead of cutting close to walls. The robot is then kept
+    # off walls by following the path, not by slowing down.
     GridBased:
-      plugin: nav2_navfn_planner::NavfnPlanner
-      use_astar: true
+      plugin: nav2_smac_planner::SmacPlanner2D
+      tolerance: 0.125
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # How hard paths avoid high-cost cells near walls. 1.0 = barely,
+      # 2.0 = Nav2's suggested trade-off, 3.0 = hug the centre (the map is
+      # small, so the extra search time does not matter).
+      cost_travel_multiplier: 3.0
+      use_final_approach_orientation: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
 
 smoother_server:
   ros__parameters:
@@ -173,3 +224,36 @@ waypoint_follower:
       plugin: nav2_waypoint_follower::WaitAtWaypoint
       enabled: true
       waypoint_pause_duration: 3500
+
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: base_link
+    odom_frame_id: odom
+    # velocity_smoother -> collision_monitor -> wall_repulsion -> turn controller
+    cmd_vel_in_topic: cmd_vel_nav_smoothed
+    cmd_vel_out_topic: cmd_vel_safe
+    state_topic: collision_monitor_state
+    transform_tolerance: 0.2
+    source_timeout: 1.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    enable_stamped_cmd_vel: false
+    # No slow-down zones: walls are handled by steering (centred path,
+    # wall_repulsion). This is only a last-resort stop if something is about
+    # to touch the front of the robot (within 4 cm ahead). It zeroes the
+    # whole command, so the stall boost never pushes into a wall.
+    polygons: ["EmergencyStop"]
+    EmergencyStop:
+      type: polygon
+      action_type: stop
+      points: "[[0.19, 0.155], [0.19, -0.155], [0.15, -0.155], [0.15, 0.155]]"
+      min_points: 3
+      visualize: true
+      polygon_pub_topic: polygon_stop
+      enabled: true
+    observation_sources: ["scan"]
+    scan:
+      type: scan
+      topic: /scan
+      enabled: true

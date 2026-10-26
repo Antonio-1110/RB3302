@@ -23,12 +23,14 @@ map frame, and sent as one FollowWaypoints goal. The pause at each square is
 waypoint_follower's wait_at_waypoint.waypoint_pause_duration.
 """
 import math
+import signal
 import sys
 
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from rclpy.utilities import remove_ros_args
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
@@ -47,10 +49,11 @@ BEARINGS = {
     'E': 0.0, 'NE': 45.0, 'N': 90.0, 'NW': 135.0,
     'W': 180.0, 'SW': -135.0, 'S': -90.0, 'SE': -45.0,
 }
-# Start pose uncertainty handed to AMCL: the robot is roughly at the square
-# centre and the bearing is approximate (+-22.5 deg to the next bearing).
-START_XY_STDDEV = 0.10
-START_YAW_STDDEV = math.radians(22.5)
+# Start pose uncertainty handed to AMCL: the robot is placed anywhere fully
+# within the square (up to ~0.15 m off centre) and the bearing is only
+# approximate (+-45 deg per the run rules).
+START_XY_STDDEV = 0.12
+START_YAW_STDDEV = math.radians(35.0)
 NOMOTION_UPDATES = 20
 # Nav2 only finishes activating once map->base_link exists (i.e. after the
 # initial pose is set); goals sent before then are rejected.
@@ -103,6 +106,33 @@ class GoLetters(Node):
             Trigger, NAV2_ACTIVE_SERVICE)
         self.amcl_state_client = self.create_client(
             GetState, AMCL_STATE_SERVICE)
+        # The FollowWaypoints goal lives in waypoint_follower, not here:
+        # exiting does not stop the robot unless the goal is cancelled.
+        self.send_future = None
+
+    def cancel_active_goal(self):
+        """Cancel the waypoint goal (if any) so the robot stops."""
+        if self.send_future is None:
+            return
+        if not self.send_future.done():
+            rclpy.spin_until_future_complete(
+                self, self.send_future, timeout_sec=2.0)
+        if not self.send_future.done():
+            self.get_logger().error(
+                'could not confirm the goal; stop the robot manually')
+            return
+        handle = self.send_future.result()
+        if handle is None or not handle.accepted:
+            return
+        self.get_logger().warn('cancelling waypoint goal...')
+        cancel = handle.cancel_goal_async()
+        rclpy.spin_until_future_complete(self, cancel, timeout_sec=3.0)
+        if cancel.done() and cancel.result().goals_canceling:
+            self.get_logger().warn('goal cancelled, robot stopping')
+        else:
+            self.get_logger().error(
+                'cancel not confirmed (goal may already be finished); '
+                'stop the robot manually if it is still moving')
 
     def sleep(self, seconds):
         """Wait while still servicing callbacks (TF, futures)."""
@@ -296,6 +326,7 @@ class GoLetters(Node):
                                        throttle_duration_sec=2.0)
 
         send = self.client.send_goal_async(goal, feedback_callback=on_feedback)
+        self.send_future = send
         rclpy.spin_until_future_complete(self, send)
         handle = send.result()
         if not handle.accepted:
@@ -306,6 +337,7 @@ class GoLetters(Node):
 
         done = handle.get_result_async()
         rclpy.spin_until_future_complete(self, done)
+        self.send_future = None   # finished: nothing left to cancel
         missed = list(done.result().result.missed_waypoints)
         if missed:
             idx = [getattr(m, 'index', m) for m in missed]
@@ -339,7 +371,10 @@ def main():
         print(e)
         return 1
 
-    rclpy.init()
+    # Keep the ROS context alive on Ctrl+C so the goal can still be
+    # cancelled; treat `kill` (SIGTERM) the same as Ctrl+C.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     node = GoLetters()
     try:
         ok = True
@@ -350,6 +385,10 @@ def main():
     except (RuntimeError, KeyboardInterrupt) as e:
         node.get_logger().error(str(e) or 'interrupted')
         ok = False
+        try:
+            node.cancel_active_goal()
+        except KeyboardInterrupt:
+            node.get_logger().error('cancel aborted; robot may still move')
     finally:
         node.destroy_node()
         rclpy.try_shutdown()

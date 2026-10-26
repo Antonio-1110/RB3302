@@ -128,3 +128,29 @@ Start planning:
 ```bash
 ros2 launch planning_rpp planning.launch.py
 ```
+
+### Calibrate the arena frame
+
+Waypoints are given as course squares (A–X), so the planner needs to know where
+the course sits on the map. Do this once after each new map, with
+`planning.launch.py` running:
+
+```bash
+ros2 run planning_rpp calibrate_arena S N F N
+```
+
+For each square/bearing pair, place the robot at the centre of that square
+facing that bearing, set `2D Pose Estimate` in RViz, and press Enter. Using two
+squares far apart (e.g. S and F) gives a more accurate angle than one. The
+result is saved as `maps/rb3302_map_arena.yaml` and loaded the next time
+`planning.launch.py` starts.
+
+### Run the course
+
+```bash
+ros2 run planning_rpp go_letters --start S0 B0 S1 S2 S3 S4
+```
+
+For example `go_letters --start S NE A H O X`: start on square S facing NE, then
+visit A, H, O and X, pausing at each. Bearings are `N NE E SE S SW W NW`, with
+N towards row A–F. The start pose replaces RViz's `2D Pose Estimate`.

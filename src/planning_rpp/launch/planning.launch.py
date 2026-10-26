@@ -1,12 +1,57 @@
+import os
+
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import (EnvironmentVariable, LaunchConfiguration,
+                                  PathJoinSubstitution, PythonExpression)
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
+
+# Hand-fitted map->arena for rb3302_map, used when there is no calibration
+# file (see calibrate_arena).
+FALLBACK_ARENA = {'arena_x': 0.380, 'arena_y': 1.643, 'arena_yaw': -2.031}
+
+
+def arena_tf(context):
+    """Publish map->arena from explicit args, the calibration file, or the
+    hand-fitted fallback, in that order."""
+    arena_file = LaunchConfiguration('arena_file').perform(context)
+    if not arena_file:
+        map_yaml = LaunchConfiguration('map').perform(context)
+        arena_file = os.path.splitext(map_yaml)[0] + '_arena.yaml'
+    values, source = dict(FALLBACK_ARENA), 'hand-fitted fallback'
+    if os.path.isfile(arena_file):
+        with open(arena_file) as f:
+            values.update(yaml.safe_load(f) or {})
+        source = arena_file
+    for key in FALLBACK_ARENA:
+        override = LaunchConfiguration(key).perform(context)
+        if override:
+            values[key], source = override, 'launch arguments'
+    map_frame = LaunchConfiguration('map_frame').perform(context)
+    return [
+        LogInfo(msg=f'arena frame from {source}: x {values["arena_x"]} '
+                    f'y {values["arena_y"]} yaw {values["arena_yaw"]}'),
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='arena_tf_publisher',
+            output='screen',
+            arguments=[
+                '--x', str(values['arena_x']),
+                '--y', str(values['arena_y']),
+                '--yaw', str(values['arena_yaw']),
+                '--frame-id', map_frame,
+                '--child-frame-id', LaunchConfiguration('arena_frame'),
+            ],
+            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+        ),
+    ]
 
 
 def generate_launch_description():
@@ -27,14 +72,20 @@ def generate_launch_description():
     imu_topic = LaunchConfiguration('imu_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     stiction_boost = LaunchConfiguration('stiction_boost')
+    turn_controller = LaunchConfiguration('turn_controller')
+    collision_monitor = LaunchConfiguration('collision_monitor')
+    wall_repulsion = LaunchConfiguration('wall_repulsion')
+    # Velocity chain: velocity_smoother -> [collision_monitor] ->
+    # wall_repulsion -> turn_rate_controller / stiction_boost -> /cmd_vel.
+    # wall_repulsion reads the collision monitor's output when it runs,
+    # else the velocity smoother's output directly.
+    repulsion_input_topic = PythonExpression([
+        "'cmd_vel_safe' if '", collision_monitor,
+        "'.lower() == 'true' else 'cmd_vel_nav_smoothed'"])
     set_initial_pose = LaunchConfiguration('set_initial_pose')
     initial_pose_x = LaunchConfiguration('initial_pose_x')
     initial_pose_y = LaunchConfiguration('initial_pose_y')
     initial_pose_yaw = LaunchConfiguration('initial_pose_yaw')
-    arena_frame = LaunchConfiguration('arena_frame')
-    arena_x = LaunchConfiguration('arena_x')
-    arena_y = LaunchConfiguration('arena_y')
-    arena_yaw = LaunchConfiguration('arena_yaw')
 
     configured_params = ParameterFile(
         RewrittenYaml(
@@ -86,33 +137,35 @@ def generate_launch_description():
         DeclareLaunchArgument('cmd_vel_topic', default_value='/cmd_vel'),
         DeclareLaunchArgument(
             'stiction_boost', default_value='true',
-            description='Boost stalled in-place turns (false = pass-through)'),
+            description='Boost stalled in-place turns (false = pass-through); '
+                        'only used when turn_controller is false'),
+        DeclareLaunchArgument(
+            'collision_monitor', default_value='true',
+            description='Slow/stop from the raw scan before hitting anything'),
+        DeclareLaunchArgument(
+            'wall_repulsion', default_value='true',
+            description='Steer away from walls seen in the live scan '
+                        '(false = pass-through)'),
+        DeclareLaunchArgument(
+            'turn_controller', default_value='true',
+            description='Closed-loop yaw-rate control from the IMU gyro '
+                        '(false = use stiction_boost instead)'),
         DeclareLaunchArgument('set_initial_pose', default_value='false'),
         DeclareLaunchArgument('initial_pose_x', default_value='0.0'),
         DeclareLaunchArgument('initial_pose_y', default_value='0.0'),
         DeclareLaunchArgument('initial_pose_yaw', default_value='0.0'),
         # Arena frame: origin at the SW inner corner of the 4x6 course (outer
-        # corner of square S), X = East (A->F), Y = North (S->A). Fitted to
-        # rb3302_map by matching the course's wall layout; re-fit if the map
-        # is rebuilt.
+        # corner of square S), X = East (A->F), Y = North (S->A). Measured by
+        # calibrate_arena into <map>_arena.yaml next to the map; arena_x/y/yaw
+        # override it.
         DeclareLaunchArgument('arena_frame', default_value='arena'),
-        DeclareLaunchArgument('arena_x', default_value='0.380'),
-        DeclareLaunchArgument('arena_y', default_value='1.643'),
-        DeclareLaunchArgument('arena_yaw', default_value='-2.031'),
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='arena_tf_publisher',
-            output='screen',
-            arguments=[
-                '--x', arena_x,
-                '--y', arena_y,
-                '--yaw', arena_yaw,
-                '--frame-id', map_frame,
-                '--child-frame-id', arena_frame,
-            ],
-            parameters=[{'use_sim_time': use_sim_time}],
-        ),
+        DeclareLaunchArgument(
+            'arena_file', default_value='',
+            description='map->arena calibration (default: <map>_arena.yaml)'),
+        DeclareLaunchArgument('arena_x', default_value=''),
+        DeclareLaunchArgument('arena_y', default_value=''),
+        DeclareLaunchArgument('arena_yaw', default_value=''),
+        OpaqueFunction(function=arena_tf),
         Node(
             package='robot_localization',
             executable='ekf_node',
@@ -226,18 +279,68 @@ def generate_launch_description():
         ),
         Node(
             package='planning_rpp',
+            executable='wall_repulsion',
+            name='wall_repulsion',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'enabled': ParameterValue(wall_repulsion, value_type=bool),
+                'base_frame': base_frame,
+            }],
+            remappings=[
+                ('cmd_vel_in', repulsion_input_topic),
+                ('cmd_vel_out', 'cmd_vel_repelled'),
+                ('scan', scan_topic),
+            ],
+        ),
+        Node(
+            package='planning_rpp',
+            executable='turn_rate_controller',
+            name='turn_rate_controller',
+            output='screen',
+            condition=IfCondition(turn_controller),
+            parameters=[{'use_sim_time': use_sim_time}],
+            remappings=[
+                ('cmd_vel_smoothed', 'cmd_vel_repelled'),
+                ('cmd_vel', cmd_vel_topic),
+                ('odom', odom_topic),
+            ],
+        ),
+        Node(
+            package='planning_rpp',
             executable='stiction_boost',
             name='stiction_boost',
             output='screen',
+            condition=UnlessCondition(turn_controller),
             parameters=[{
                 'use_sim_time': use_sim_time,
                 'enabled': ParameterValue(stiction_boost, value_type=bool),
             }],
             remappings=[
-                ('cmd_vel_smoothed', 'cmd_vel_nav_smoothed'),
+                ('cmd_vel_smoothed', 'cmd_vel_repelled'),
                 ('cmd_vel', cmd_vel_topic),
                 ('odom', odom_topic),
             ],
+        ),
+        Node(
+            package='nav2_collision_monitor',
+            executable='collision_monitor',
+            name='collision_monitor',
+            output='screen',
+            condition=IfCondition(collision_monitor),
+            parameters=[configured_params],
+        ),
+        Node(
+            package='nav2_lifecycle_manager',
+            executable='lifecycle_manager',
+            name='lifecycle_manager_collision_monitor',
+            output='screen',
+            condition=IfCondition(collision_monitor),
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'autostart': autostart,
+                'node_names': ['collision_monitor'],
+            }],
         ),
         Node(
             package='nav2_smoother',

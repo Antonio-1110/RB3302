@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Steer away from nearby walls using the live LiDAR scan.
+
+Sits in the velocity chain after the collision monitor and before the turn
+controller:
+
+    velocity_smoother -> collision_monitor -> wall_repulsion
+        -> turn_rate_controller -> /cmd_vel
+
+RPP follows the planned path but ignores how close walls are, and around
+corners it cuts the inside of the bend. This node looks at the raw scan in
+the robot's own frame (no map, no localisation involved) and, while the
+robot is driving forward, adds a turn away from any wall that comes within
+`influence_dist` of the robot's sides or front corners:
+
+    clearance d = distance from a scan point to the robot's footprint
+    weight     w = (influence_dist - d) / influence_dist      (0..1)
+    correction   = gain * (w_right - w_left)                  (rad/s)
+
+The closest point on each side sets that side's weight, so a wall on the
+left turns the robot right and vice versa; equal walls on both sides (a
+narrow corridor) cancel out.
+
+With this 0.31 m robot in 0.6 m corridors, the footprint is normally 5-9 cm
+from the walls while cornering (simulated on rb3302_map), so the default
+influence of 0.05 m only reacts when the robot is closer than a normal turn
+brings it. A larger influence makes it fight every corner.
+
+It never cancels or reverses a turn RPP is commanding: when the correction
+opposes the commanded turn (e.g. turning round the end of a wall, which is
+the nearest thing on the inside of the turn), it can soften that turn by at
+most max_oppose_fraction of it. When driving straight it acts in full.
+
+Not applied while turning on the spot or reversing (it would fight the
+pivot), and points inside the footprint are ignored (self-hits / noise).
+Obstacles straight ahead are left to the collision monitor.
+
+Tuning: watch ~/debug (x = left weight, y = right weight, z = correction):
+    ros2 topic echo /wall_repulsion/debug
+"""
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.duration import Duration
+from geometry_msgs.msg import Twist, Vector3
+from sensor_msgs.msg import LaserScan
+from tf2_ros import Buffer, TransformListener
+
+
+def quat_to_matrix(q):
+    x, y, z, w = q.x, q.y, q.z, q.w
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+class WallRepulsion(Node):
+
+    def __init__(self):
+        super().__init__('wall_repulsion')
+        p = self.declare_parameter
+        self.enabled = p('enabled', True).value
+        self.base_frame = p('base_frame', 'base_link').value
+        # Footprint half-extents (m): front, back, half-width. Match
+        # nav2_params.yaml footprint.
+        self.front = p('footprint_front', 0.15).value
+        self.back = p('footprint_back', 0.15).value
+        self.half_width = p('footprint_half_width', 0.155).value
+        # Walls closer than this to the footprint start pushing.
+        self.influence = p('influence_dist', 0.05).value
+        # Max correction (rad/s) when a wall touches the footprint.
+        self.gain = p('gain', 0.8).value
+        # Max share of a commanded turn the correction may take away when it
+        # pushes against that turn (0.5 = at most halve it, never reverse).
+        self.max_oppose = p('max_oppose_fraction', 0.5).value
+        # Only look at points from slightly behind the robot centre to this
+        # far ahead of the front edge (the part that can hit while driving).
+        self.look_back = p('look_back', 0.10).value
+        self.look_ahead = p('look_ahead', 0.15).value
+        # Apply only when driving forward faster than this (m/s).
+        self.min_linear = p('min_linear', 0.03).value
+        self.scan_timeout = p('scan_timeout', 0.5).value
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.laser_tf = None          # (rotation matrix, translation)
+        self.w_left = 0.0
+        self.w_right = 0.0
+        self.last_scan_time = None
+
+        self.pub = self.create_publisher(Twist, 'cmd_vel_out', 10)
+        self.debug_pub = self.create_publisher(Vector3, '~/debug', 10)
+        self.create_subscription(Twist, 'cmd_vel_in', self.on_cmd, 10)
+        self.create_subscription(LaserScan, 'scan', self.on_scan, 10)
+        self.get_logger().info(
+            f'wall repulsion {"on" if self.enabled else "off"}: '
+            f'influence {self.influence} m, gain {self.gain} rad/s')
+
+    def lookup_laser_tf(self, frame):
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.base_frame, frame, Time(),
+                timeout=Duration(seconds=0.0))
+        except Exception as e:  # noqa: BLE001 - tf2 raises several types
+            self.get_logger().warn(
+                f'waiting for {self.base_frame} <- {frame}: {e}',
+                throttle_duration_sec=2.0)
+            return None
+        tr = t.transform.translation
+        # The laser is fixed to the robot, so this is looked up once.
+        return quat_to_matrix(t.transform.rotation), (tr.x, tr.y)
+
+    def clearance(self, x, y):
+        """Distance from (x, y) to the footprint rectangle; <0 inside."""
+        dx = max(-self.back - x, 0.0, x - self.front)
+        dy = max(-self.half_width - y, 0.0, y - self.half_width)
+        if dx == 0.0 and dy == 0.0:
+            return -1.0
+        return math.hypot(dx, dy)
+
+    def on_scan(self, msg):
+        if self.laser_tf is None:
+            self.laser_tf = self.lookup_laser_tf(msg.header.frame_id)
+            if self.laser_tf is None:
+                return
+        rot, (tx, ty) = self.laser_tf
+        w_left = w_right = 0.0
+        angle = msg.angle_min
+        for r in msg.ranges:
+            a = angle
+            angle += msg.angle_increment
+            if not (msg.range_min <= r <= msg.range_max) or math.isinf(r):
+                continue
+            lx, ly = r * math.cos(a), r * math.sin(a)
+            x = rot[0][0] * lx + rot[0][1] * ly + tx
+            y = rot[1][0] * lx + rot[1][1] * ly + ty
+            if x < -self.look_back or x > self.front + self.look_ahead:
+                continue
+            # Straight ahead is the collision monitor's job.
+            if abs(y) <= self.half_width and x > self.front:
+                continue
+            d = self.clearance(x, y)
+            if d < 0.0 or d >= self.influence:
+                continue
+            w = (self.influence - d) / self.influence
+            if y > 0.0:
+                w_left = max(w_left, w)
+            else:
+                w_right = max(w_right, w)
+        self.w_left, self.w_right = w_left, w_right
+        self.last_scan_time = self.get_clock().now()
+
+    def scan_fresh(self, now):
+        return (self.last_scan_time is not None and
+                (now - self.last_scan_time).nanoseconds / 1e9 <
+                self.scan_timeout)
+
+    def on_cmd(self, msg):
+        now = self.get_clock().now()
+        correction = 0.0
+        if (self.enabled and msg.linear.x > self.min_linear and
+                self.scan_fresh(now)):
+            # Wall on the right -> turn left (+), wall on the left -> right.
+            correction = self.gain * (self.w_right - self.w_left)
+            w_cmd = msg.angular.z
+            if correction * w_cmd < 0.0:
+                limit = self.max_oppose * abs(w_cmd)
+                correction = math.copysign(min(abs(correction), limit),
+                                           correction)
+        out = Twist()
+        out.linear = msg.linear
+        out.angular.x, out.angular.y = msg.angular.x, msg.angular.y
+        out.angular.z = msg.angular.z + correction
+        self.pub.publish(out)
+        self.debug_pub.publish(
+            Vector3(x=self.w_left, y=self.w_right, z=correction))
+        if abs(correction) > 0.05:
+            self.get_logger().info(
+                f'wall {"right" if correction > 0 else "left"}: '
+                f'turning away {correction:+.2f} rad/s',
+                throttle_duration_sec=1.0)
+
+
+def main():
+    rclpy.init()
+    node = WallRepulsion()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()

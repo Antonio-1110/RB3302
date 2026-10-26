@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Measure the map->arena transform with the robot instead of fitting it by eye.
+
+Usage (with planning.launch.py running):
+    ros2 run planning_rpp calibrate_arena S N
+    ros2 run planning_rpp calibrate_arena S N F N X W
+    ros2 run planning_rpp calibrate_arena S N --out /path/to/map_arena.yaml
+
+Each SQUARE BEARING pair is one sample: place the robot at the centre of
+SQUARE facing BEARING (N NE E SE S SW W NW, N = towards row A-F), localise it
+with RViz's 2D Pose Estimate, then press Enter. The robot's AMCL pose is
+averaged and matched against the square's known arena position.
+
+With one sample, the arena yaw comes from the robot's heading, so place it
+carefully square to the walls. With samples at two or more different squares
+(ideally far apart, e.g. S and F), the yaw comes from the square positions,
+which is much less sensitive to how the robot is turned.
+
+The result is written next to the default map as <map>_arena.yaml, which
+planning.launch.py loads automatically. Re-run after rebuilding the map.
+"""
+import math
+import os
+import sys
+
+import rclpy
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.utilities import remove_ros_args
+from std_srvs.srv import Empty
+from tf2_ros import Buffer, TransformListener
+
+CELL_SIZE = 0.6
+ROWS = ['ABCDEF', 'GHIJKL', 'MNOPQR', 'STUVWX']  # north to south
+MAP_FRAME = 'map'
+BASE_FRAME = 'base_link'
+ARENA_FRAME = 'arena'
+BEARINGS = {
+    'E': 0.0, 'NE': 45.0, 'N': 90.0, 'NW': 135.0,
+    'W': 180.0, 'SW': -135.0, 'S': -90.0, 'SE': -45.0,
+}
+DEFAULT_OUT = os.path.join(
+    os.path.expanduser('~'), 'rb3302_final_proj_code', 'student_ws', 'maps',
+    'rb3302_map_arena.yaml')
+NOMOTION_UPDATES = 20
+SAMPLE_TIME = 2.0
+# Below this spread between sample squares, positions say little about yaw.
+MIN_YAW_BASELINE = CELL_SIZE
+
+
+def letter_to_arena(letter):
+    """Return the (x, y) centre of a square in the arena frame."""
+    for i, row in enumerate(ROWS):
+        col = row.find(letter)
+        if col >= 0:
+            return ((col + 0.5) * CELL_SIZE,
+                    (len(ROWS) - 1 - i + 0.5) * CELL_SIZE)
+    raise ValueError(f'unknown square {letter!r}; use A-X')
+
+
+def bearing_to_arena(bearing):
+    """Return the arena-frame yaw (radians) of a course bearing."""
+    if bearing not in BEARINGS:
+        raise ValueError(
+            f'unknown bearing {bearing!r}; use one of {" ".join(BEARINGS)}')
+    return math.radians(BEARINGS[bearing])
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def wrap(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def circular_mean(angles):
+    return math.atan2(sum(math.sin(a) for a in angles),
+                      sum(math.cos(a) for a in angles))
+
+
+def fit_arena(samples):
+    """Fit the arena pose in the map frame.
+
+    samples: list of ((ax, ay, a_yaw), (mx, my, m_yaw)) pairs of the same
+    robot pose in arena and map coordinates.
+    Returns (tx, ty, yaw, yaw_source) such that map = R(yaw) * arena + t.
+    """
+    heading_yaw = circular_mean([m[2] - a[2] for a, m in samples])
+    n = len(samples)
+    cax = sum(a[0] for a, _ in samples) / n
+    cay = sum(a[1] for a, _ in samples) / n
+    cmx = sum(m[0] for _, m in samples) / n
+    cmy = sum(m[1] for _, m in samples) / n
+    baseline = max(math.hypot(a[0] - cax, a[1] - cay) for a, _ in samples)
+    if baseline * 2.0 >= MIN_YAW_BASELINE:
+        # 2D Procrustes: rotation that best maps the centred arena points
+        # onto the centred map points.
+        dot = cross = 0.0
+        for a, m in samples:
+            px, py = a[0] - cax, a[1] - cay
+            qx, qy = m[0] - cmx, m[1] - cmy
+            dot += px * qx + py * qy
+            cross += px * qy - py * qx
+        yaw, source = math.atan2(cross, dot), 'square positions'
+    else:
+        yaw, source = heading_yaw, 'robot heading'
+    c, s = math.cos(yaw), math.sin(yaw)
+    tx = cmx - (c * cax - s * cay)
+    ty = cmy - (s * cax + c * cay)
+    return tx, ty, yaw, source
+
+
+def residuals(samples, tx, ty, yaw):
+    """Return (position error m, heading error rad) per sample."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = []
+    for a, m in samples:
+        px = tx + c * a[0] - s * a[1]
+        py = ty + s * a[0] + c * a[1]
+        out.append((math.hypot(m[0] - px, m[1] - py),
+                    wrap(m[2] - (a[2] + yaw))))
+    return out
+
+
+class CalibrateArena(Node):
+
+    def __init__(self):
+        super().__init__('calibrate_arena')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.nomotion_client = self.create_client(
+            Empty, 'request_nomotion_update')
+
+    def sleep(self, seconds):
+        """Wait while still servicing callbacks (TF, futures)."""
+        end = self.get_clock().now() + Duration(seconds=seconds)
+        while rclpy.ok() and self.get_clock().now() < end:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+    def lookup(self, parent, child):
+        """Return (x, y, yaw) of child in parent, or None."""
+        try:
+            t = self.tf_buffer.lookup_transform(parent, child, Time())
+        except Exception:  # noqa: BLE001 - caller decides what to do
+            return None
+        return (t.transform.translation.x, t.transform.translation.y,
+                yaw_of(t.transform.rotation))
+
+    def settle_amcl(self):
+        """Force scan updates so AMCL refines the pose without moving."""
+        if not self.nomotion_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn(
+                'request_nomotion_update unavailable; using the pose as is')
+            return
+        for _ in range(NOMOTION_UPDATES):
+            self.nomotion_client.call_async(Empty.Request())
+            self.sleep(0.1)
+
+    def sample_pose(self):
+        """Average map->base_link over SAMPLE_TIME seconds."""
+        self.sleep(0.5)  # refill the TF buffer after waiting on input()
+        if self.lookup(MAP_FRAME, BASE_FRAME) is None:
+            raise RuntimeError(
+                f'no {MAP_FRAME}->{BASE_FRAME} transform; set the pose with '
+                'RViz 2D Pose Estimate first')
+        self.settle_amcl()
+        poses = []
+        end = self.get_clock().now() + Duration(seconds=SAMPLE_TIME)
+        while rclpy.ok() and self.get_clock().now() < end:
+            p = self.lookup(MAP_FRAME, BASE_FRAME)
+            if p is not None:
+                poses.append(p)
+            self.sleep(0.1)
+        if not poses:
+            raise RuntimeError(f'lost {MAP_FRAME}->{BASE_FRAME} while sampling')
+        n = len(poses)
+        return (sum(p[0] for p in poses) / n, sum(p[1] for p in poses) / n,
+                circular_mean([p[2] for p in poses]))
+
+
+def write_result(path, tx, ty, yaw, squares):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write('# map->arena transform, written by calibrate_arena from '
+                f'squares {" ".join(squares)}.\n')
+        f.write('# Loaded by planning.launch.py; re-run after rebuilding the '
+                'map.\n')
+        f.write(f'arena_x: {tx:.4f}\n')
+        f.write(f'arena_y: {ty:.4f}\n')
+        f.write(f'arena_yaw: {yaw:.4f}\n')
+
+
+def main():
+    argv = remove_ros_args(sys.argv)[1:]
+    out = DEFAULT_OUT
+    if '--out' in argv:
+        i = argv.index('--out')
+        if i + 1 >= len(argv):
+            print('--out needs a file path')
+            return 1
+        out = os.path.expanduser(argv[i + 1])
+        argv = argv[:i] + argv[i + 2:]
+    if not argv or len(argv) % 2:
+        print(__doc__)
+        return 1
+    pairs = [(argv[i].upper(), argv[i + 1].upper())
+             for i in range(0, len(argv), 2)]
+    try:
+        targets = [(*letter_to_arena(sq), bearing_to_arena(b))
+                   for sq, b in pairs]
+    except ValueError as e:
+        print(e)
+        return 1
+
+    rclpy.init()
+    node = CalibrateArena()
+    try:
+        samples = []
+        for (square, bearing), target in zip(pairs, targets):
+            input(f'\nPlace the robot at the centre of {square} facing '
+                  f'{bearing}, set RViz 2D Pose Estimate, wait for the scan '
+                  'to line up with the map, then press Enter...')
+            pose = node.sample_pose()
+            print(f'  {square}: map ({pose[0]:.3f}, {pose[1]:.3f}, '
+                  f'yaw {math.degrees(pose[2]):.1f} deg)')
+            samples.append((target, pose))
+
+        tx, ty, yaw, source = fit_arena(samples)
+        print(f'\narena in map: x {tx:.4f}  y {ty:.4f}  '
+              f'yaw {yaw:.4f} rad ({math.degrees(yaw):.1f} deg, '
+              f'from {source})')
+        for (square, _), (dpos, dyaw) in zip(
+                pairs, residuals(samples, tx, ty, yaw)):
+            print(f'  {square}: position error {dpos * 100:.1f} cm, '
+                  f'heading error {math.degrees(dyaw):.1f} deg')
+
+        current = node.lookup(MAP_FRAME, ARENA_FRAME)
+        if current is not None:
+            print(f'previous arena: x {current[0]:.4f}  y {current[1]:.4f}  '
+                  f'yaw {current[2]:.4f} rad (moved '
+                  f'{math.hypot(tx - current[0], ty - current[1]) * 100:.1f} '
+                  f'cm, {math.degrees(wrap(yaw - current[2])):.1f} deg)')
+
+        write_result(out, tx, ty, yaw, [sq for sq, _ in pairs])
+        print(f'\nwrote {out}; restart planning.launch.py to use it')
+        ok = True
+    except (RuntimeError, KeyboardInterrupt, EOFError) as e:
+        node.get_logger().error(str(e) or 'interrupted')
+        ok = False
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
