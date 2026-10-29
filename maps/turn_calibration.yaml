@@ -1,0 +1,9 @@
+# Wave Rover turning response, measured with calibrate_turning on 2026-10-28:
+#   actual turn rate = (command - offset) / kff
+# Loaded by planning.launch.py into turn_rate_controller.
+turn_rate_controller:
+  ros__parameters:
+    kff_inplace: 2.09
+    offset_inplace: 0.40
+    kff_moving: 2.37
+    offset_moving: 0.09

@@ -54,6 +54,38 @@ def arena_tf(context):
     ]
 
 
+def turn_controller_node(context):
+    """turn_rate_controller, with the base's measured turning correction
+    from <map dir>/turn_calibration.yaml (see calibrate_turning) when that
+    file exists; otherwise the node's built-in defaults."""
+    map_yaml = LaunchConfiguration('map').perform(context)
+    calib = os.path.join(os.path.dirname(map_yaml), 'turn_calibration.yaml')
+    params = [{'use_sim_time': LaunchConfiguration('use_sim_time')}]
+    if os.path.isfile(calib):
+        params.append(calib)
+        source = calib
+    else:
+        source = 'built-in defaults (run calibrate_turning)'
+    # The turn controller reads wall_repulsion's output (see the velocity
+    # chain in generate_launch_description).
+    turn_input = 'cmd_vel_repelled'
+    return [
+        LogInfo(msg=f'turn calibration from {source}'),
+        Node(
+            package='planning_rpp',
+            executable='turn_rate_controller',
+            name='turn_rate_controller',
+            output='screen',
+            parameters=params,
+            remappings=[
+                ('cmd_vel_smoothed', turn_input),
+                ('cmd_vel', LaunchConfiguration('cmd_vel_topic')),
+                ('odom', LaunchConfiguration('odom_topic')),
+            ],
+        ),
+    ]
+
+
 def generate_launch_description():
     share = get_package_share_directory('planning_rpp')
 
@@ -77,8 +109,8 @@ def generate_launch_description():
     wall_repulsion = LaunchConfiguration('wall_repulsion')
     # Velocity chain: velocity_smoother -> [collision_monitor] ->
     # wall_repulsion -> turn_rate_controller / stiction_boost -> /cmd_vel.
-    # wall_repulsion reads the collision monitor's output when it runs,
-    # else the velocity smoother's output directly.
+    # wall_repulsion reads the collision monitor's output when it runs, else
+    # the smoother's; with wall_repulsion:=false it passes commands through.
     repulsion_input_topic = PythonExpression([
         "'cmd_vel_safe' if '", collision_monitor,
         "'.lower() == 'true' else 'cmd_vel_nav_smoothed'"])
@@ -140,12 +172,17 @@ def generate_launch_description():
             description='Boost stalled in-place turns (false = pass-through); '
                         'only used when turn_controller is false'),
         DeclareLaunchArgument(
-            'collision_monitor', default_value='true',
-            description='Slow/stop from the raw scan before hitting anything'),
+            # Off by default: its emergency stop zeroes every command,
+            # pivots included, so a robot that stops with its front near a
+            # wall cannot turn away and stays stuck until a spin recovery
+            # (seen at square F, 2026-10-28). RPP's own collision check and
+            # the costmaps still keep paths off walls.
+            'collision_monitor', default_value='false',
+            description='Emergency stop from the raw scan (true = on)'),
         DeclareLaunchArgument(
             'wall_repulsion', default_value='true',
-            description='Steer away from walls seen in the live scan '
-                        '(false = pass-through)'),
+            description='Steer away from walls within 5 cm of the robot, from '
+                        'the live scan (false = pass-through)'),
         DeclareLaunchArgument(
             'turn_controller', default_value='true',
             description='Closed-loop yaw-rate control from the IMU gyro '
@@ -167,6 +204,18 @@ def generate_launch_description():
         DeclareLaunchArgument('arena_yaw', default_value=''),
         OpaqueFunction(function=arena_tf),
         Node(
+            package='planning_rpp',
+            executable='odom_direction_fix',
+            name='odom_direction_fix',
+            output='screen',
+            parameters=[{'use_sim_time': use_sim_time}],
+            remappings=[
+                ('odom_in', raw_odom_topic),
+                ('odom_out', '/odom/raw_signed'),
+                ('cmd_vel', cmd_vel_topic),
+            ],
+        ),
+        Node(
             package='robot_localization',
             executable='ekf_node',
             name='ekf_filter_node',
@@ -184,7 +233,9 @@ def generate_launch_description():
                 'odom_frame': odom_frame,
                 'base_link_frame': base_frame,
                 'world_frame': odom_frame,
-                'odom0': raw_odom_topic,
+                # Wheel odometry with its direction fixed (see
+                # odom_direction_fix): the base reports reversing as forward.
+                'odom0': '/odom/raw_signed',
                 'odom0_config': [
                     False, False, False,
                     False, False, False,
@@ -195,8 +246,6 @@ def generate_launch_description():
                 'odom0_queue_size': 10,
                 'odom0_differential': False,
                 'odom0_relative': False,
-                'odom0_pose_rejection_threshold': 5.0,
-                'odom0_twist_rejection_threshold': 5.0,
                 'imu0': imu_topic,
                 'imu0_config': [
                     False, False, False,
@@ -209,8 +258,11 @@ def generate_launch_description():
                 'imu0_differential': False,
                 'imu0_relative': True,
                 'imu0_remove_gravitational_acceleration': False,
-                'imu0_pose_rejection_threshold': 5.0,
-                'imu0_twist_rejection_threshold': 5.0,
+                # No outlier rejection (robot_localization's default). With
+                # a threshold of 5 the EKF threw away the gyro whenever the
+                # robot started a fast pivot (a sudden ~1.2 rad/s against a
+                # confident 0 estimate), so /odom read ~0 rad/s while the
+                # robot spun, and the heading froze until it caught up.
             }],
             remappings=[('odometry/filtered', odom_topic)],
         ),
@@ -286,6 +338,11 @@ def generate_launch_description():
                 'use_sim_time': use_sim_time,
                 'enabled': ParameterValue(wall_repulsion, value_type=bool),
                 'base_frame': base_frame,
+                'influence_dist': 0.05,
+                # Real robot: 20 x 20 cm about its turning centre.
+                'footprint_front': 0.10,
+                'footprint_back': 0.10,
+                'footprint_half_width': 0.10,
             }],
             remappings=[
                 ('cmd_vel_in', repulsion_input_topic),
@@ -293,19 +350,8 @@ def generate_launch_description():
                 ('scan', scan_topic),
             ],
         ),
-        Node(
-            package='planning_rpp',
-            executable='turn_rate_controller',
-            name='turn_rate_controller',
-            output='screen',
-            condition=IfCondition(turn_controller),
-            parameters=[{'use_sim_time': use_sim_time}],
-            remappings=[
-                ('cmd_vel_smoothed', 'cmd_vel_repelled'),
-                ('cmd_vel', cmd_vel_topic),
-                ('odom', odom_topic),
-            ],
-        ),
+        OpaqueFunction(function=turn_controller_node,
+                       condition=IfCondition(turn_controller)),
         Node(
             package='planning_rpp',
             executable='stiction_boost',
@@ -355,7 +401,10 @@ def generate_launch_description():
             name='behavior_server',
             output='screen',
             parameters=[configured_params],
-            remappings=[('cmd_vel', cmd_vel_topic)],
+            # Spin / back-up go through the velocity smoother and turn
+            # controller like normal driving, so slow spin commands are not
+            # lost in the base's ~0.4 rad/s pivot dead zone.
+            remappings=[('cmd_vel', 'cmd_vel_nav_raw')],
         ),
         Node(
             package='nav2_bt_navigator',

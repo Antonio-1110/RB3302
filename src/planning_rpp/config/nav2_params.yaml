@@ -6,11 +6,24 @@ amcl:
     global_frame_id: map
     scan_topic: scan
     robot_model_type: nav2_amcl::DifferentialMotionModel
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
+    # Motion noise. Heading comes from the gyro, which is accurate, so the
+    # rotation terms stay small. Wheel distance is not: pushing against a
+    # wall the wheels slip and the encoders report full motion while the
+    # robot stands still, so translation noise is large -- the particles
+    # then also cover "did not really move" and the scan can pick it.
+    alpha1: 0.2    # rotation noise from rotation
+    alpha2: 0.2    # rotation noise from translation
+    alpha3: 0.6    # translation noise from translation (wheel slip)
+    alpha4: 0.3    # translation noise from rotation
     alpha5: 0.2
+    # Laser model: sharp enough for a 4 m arena of 60 cm squares (defaults
+    # sigma_hit 0.2 / z_hit 0.5 / z_rand 0.5 / 60 beams accept scans that
+    # are ~20 cm off the walls and barely pull the pose back).
+    laser_model_type: likelihood_field
+    sigma_hit: 0.08
+    z_hit: 0.9
+    z_rand: 0.1
+    max_beams: 120
     # Tuned on the robot: a large particle pool for the loose start pose
     # (+-0.15 m, +-45 deg) and frequent scan corrections (every 5 cm / ~6 deg)
     # for the tight goal tolerance.
@@ -39,8 +52,14 @@ controller_server:
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath"]
+    # Fallback: if the robot moves less than 0.15 m in 5 s, the controller
+    # gives up and Nav2 runs its recovery behaviours (clear costmaps, spin,
+    # back up, replan). Was the default 0.5 m in 10 s. A pivot alone does not
+    # count as progress, but pivots take <4 s at the calibrated turn rate.
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
+      required_movement_radius: 0.15
+      movement_time_allowance: 5.0
     goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
       # A 0.31 m robot stays fully inside a 0.6 m square up to ~0.145 m off
@@ -52,12 +71,18 @@ controller_server:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       desired_linear_vel: 0.2
       # Short lookahead: RPP steers at a point this far along the path, so a
-      # long one cuts the inside of corners. Raise if it weaves on straights.
-      lookahead_dist: 0.25
-      min_lookahead_dist: 0.2
+      # long one cuts the inside of corners (~0.3 x lookahead on a 90 deg
+      # corner: 0.25 -> ~7 cm, 0.18 -> ~5 cm). Too short amplifies AMCL
+      # jitter into steering (turn command ~ error / lookahead^2), so raise
+      # it again (0.20-0.22) if the robot weaves on straights.
+      lookahead_dist: 0.18
+      min_lookahead_dist: 0.15
       max_lookahead_dist: 0.35
       lookahead_time: 1.5
-      rotate_to_heading_angular_vel: 1.5
+      # Requested pivot rate (turn_rate_controller converts it for the base).
+      # 0.6 rather than 1.0: the base keeps turning ~0.45 s after a command
+      # drops, so a faster pivot overshoots further (2026-10-29 recording).
+      rotate_to_heading_angular_vel: 0.6
       transform_tolerance: 0.1
       use_velocity_scaled_lookahead_dist: false
       min_approach_linear_velocity: 0.1
@@ -79,7 +104,12 @@ controller_server:
       # Skid-steer pivots far better than it curves: turn on the spot to
       # face the path whenever it is more than ~29 deg off.
       rotate_to_heading_min_angle: 0.5
-      max_angular_accel: 3.2
+      # RPP ramps pivot commands from the MEASURED turn rate, at most
+      # max_angular_accel * 0.05 s per cycle. At 3.2 a stationary robot was
+      # asked for 0.16 rad/s, which the base cannot pivot at, so it stayed
+      # stationary for 15-40 s (0903 recording). 20 lets the first pivot
+      # command reach the full rate; the velocity smoother still ramps it.
+      max_angular_accel: 20.0
 
 local_costmap:
   local_costmap:
@@ -91,7 +121,9 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      footprint: "[[0.15, 0.155], [0.15, -0.155], [-0.15, -0.155], [-0.15, 0.155]]"
+      # Real robot: 20 x 20 cm, turning about its centre (measured
+      # 2026-10-29; the earlier 30 x 31 cm came from the URDF estimate).
+      footprint: "[[0.10, 0.10], [0.10, -0.10], [-0.10, -0.10], [-0.10, 0.10]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -104,7 +136,7 @@ local_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         # Course corridors are ~0.6 m wide, so a centred robot is ~0.3 m from
-        # each wall. Cost starts at the footprint edge (0.15 m) and fades out
+        # each wall. Cost starts at the footprint edge (0.10 m) and fades out
         # by 0.35 m, so planned paths are pushed to the middle of corridors.
         inflation_radius: 0.35
         cost_scaling_factor: 6.0
@@ -117,7 +149,15 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       resolution: 0.05
-      footprint: "[[0.15, 0.155], [0.15, -0.155], [-0.15, -0.155], [-0.15, 0.155]]"
+      # Real robot: 20 x 20 cm, turning about its centre (measured
+      # 2026-10-29; the earlier 30 x 31 cm came from the URDF estimate).
+      footprint: "[[0.10, 0.10], [0.10, -0.10], [-0.10, -0.10], [-0.10, 0.10]]"
+      # Planning only: the planner checks the robot as a circle the size of
+      # its half-width (0.10 m), but its corners reach 0.141 m. A 5 cm pad
+      # keeps planned paths at least 0.15 m (centre) from walls, so an
+      # angled robot's corners clear them. The local costmap (RPP's
+      # collision check) is unpadded.
+      footprint_padding: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
@@ -134,7 +174,7 @@ global_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         # Course corridors are ~0.6 m wide, so a centred robot is ~0.3 m from
-        # each wall. Cost starts at the footprint edge (0.15 m) and fades out
+        # each wall. Cost starts at the footprint edge (0.10 m) and fades out
         # by 0.35 m, so planned paths are pushed to the middle of corridors.
         inflation_radius: 0.35
         cost_scaling_factor: 6.0
@@ -163,9 +203,12 @@ planner_server:
       max_on_approach_iterations: 1000
       max_planning_time: 2.0
       # How hard paths avoid high-cost cells near walls. 1.0 = barely,
-      # 2.0 = Nav2's suggested trade-off, 3.0 = hug the centre (the map is
-      # small, so the extra search time does not matter).
-      cost_travel_multiplier: 3.0
+      # 2.0 = Nav2's suggested trade-off. 8 keeps paths in the middle of
+      # corridors and through turns (simulated on rb3302_map: worst corner
+      # gap on I->N / N->F 0 cm -> 7.6 cm together with the global
+      # footprint_padding and go_letters' target nudge). The map is tiny, so
+      # the extra search time does not matter.
+      cost_travel_multiplier: 8.0
       use_final_approach_orientation: false
       smoother:
         max_iterations: 1000
@@ -247,7 +290,7 @@ collision_monitor:
     EmergencyStop:
       type: polygon
       action_type: stop
-      points: "[[0.19, 0.155], [0.19, -0.155], [0.15, -0.155], [0.15, 0.155]]"
+      points: "[[0.14, 0.10], [0.14, -0.10], [0.10, -0.10], [0.10, 0.10]]"
       min_points: 3
       visualize: true
       polygon_pub_topic: polygon_stop

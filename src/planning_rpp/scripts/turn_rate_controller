@@ -1,48 +1,40 @@
 #!/usr/bin/env python3
-"""Closed-loop yaw-rate control for the skid-steer base, using the IMU gyro.
+"""Make the skid-steer base actually turn at the rate Nav2 asks for.
 
-Sits between Nav2's velocity_smoother and the base driver (it replaces
-stiction_boost in that slot):
+Sits between the collision monitor and the base driver:
 
-    velocity_smoother -> cmd_vel_smoothed -> turn_rate_controller -> cmd_vel
+    velocity_smoother -> collision_monitor -> turn_rate_controller -> /cmd_vel
 
-Problem: the base turns by scrubbing its tyres, so the yaw rate it actually
-achieves is well below the yaw rate it is asked for, especially for gentle
-curves while driving. RPP assumes it gets what it asks for, so the robot
-under-turns, swings wide of the path and corrects late.
+Why: recorded runs show the Wave Rover turns at only ~1/3 of the commanded
+yaw rate while driving and ~1/2 when pivoting, and does not pivot at all
+for small commands (wheel scrub). RPP assumes it gets what it asks for, so
+the robot under-turns, swings wide into walls, and stalls in pivots.
 
-Fix: compare the requested yaw rate (from Nav2) with the measured yaw rate
-(EKF /odom twist, which comes from the H30 gyro) and adjust the command with
-a feedforward + PI loop until they match:
+How (deliberately simple):
+  1. Feedforward from the base's measured response, which is a deadband
+     plus a gain:  actual = (command - offset) / kff  (calibrate_turning,
+     2026-10-28: pivot offset 0.40 / kff 2.09, driving 0.09 / 2.37). So to
+     get the requested rate w the command is  sign(w) * (offset + kff*|w|),
+     with separate values for pivoting and driving. The launch file loads
+     them from maps/turn_calibration.yaml (written by calibrate_turning).
+  2. Optional minimum pivot command (min_inplace_angular, 0 = off).
+  3. Small PI trim on the gyro yaw rate (EKF /odom) for what the fixed
+     scale misses. Reset whenever the turn direction changes, clamped to
+     +-i_max, and never allowed to flip the turn direction.
+  4. No pushing past the request (2026-10-29 recording): the base answers
+     with ~0.1 s delay and a ~0.35 s time constant, so it keeps turning
+     after the request drops. The dead-zone offset is only there to GET the
+     robot turning, so it fades out as the measured rate reaches the
+     requested one and is gone once the robot turns brake_band faster. When
+     the robot turns faster than asked it is braked with kp_brake, and the
+     integral only grows while the robot is slower than asked (it bleeds
+     off otherwise). Before this, pivots ran at the 3.0 rad/s limit while
+     already at the requested rate, and every correction overshot.
+The linear velocity passes through unchanged. If /odom goes stale the trim
+is dropped and only the feedforward is applied.
 
-    out = kff * w_ref + kp * (w_ref - w_meas) + integral
-
-The integral term also handles static friction for turns on the spot (it
-keeps building while the robot is stalled), which is what stiction_boost did.
-
-Linear stall boost: if Nav2 asks the robot to drive but it has not moved for
-stall_time (2 s) -- wheel odometry shows no speed and the gyro shows no
-turning -- the forward/backward command is raised gradually (up to
-max_linear_boost) until the robot breaks free, then the boost fades out.
-The IMU alone cannot tell whether the robot is creeping forward (its
-accelerometer only measures acceleration), so "not moving" uses the EKF
-/odom twist: wheel-encoder speed plus the gyro yaw rate. Wheels spinning in
-place against something do NOT trigger it (they read as moving), and a
-command the collision monitor has zeroed is never boosted.
-
-Safety:
-  * With no fresh /odom the command passes through untouched.
-  * When Nav2 asks for (almost) no rotation, the command passes through and
-    the integral is cleared, so the robot never turns on its own.
-  * The output never has the opposite sign to the request.
-  * If the measured yaw rate keeps having the opposite sign to a clear turn
-    command, the gyro sign or TF is wrong; the loop would then push the wrong
-    way, so the node logs an error and falls back to pass-through.
-
-Tuning: watch ~/debug (x = requested, y = measured, z = sent) with
-    ros2 run rqt_plot rqt_plot /turn_rate_controller/debug/x \
-        /turn_rate_controller/debug/y /turn_rate_controller/debug/z
-y should track x. If it lags, raise ki; if it overshoots or wobbles, lower kp.
+Tuning: watch ~/debug (x = requested, y = measured, z = sent):
+    ros2 topic echo /turn_rate_controller/debug
 """
 import math
 
@@ -58,59 +50,31 @@ class TurnRateController(Node):
         super().__init__('turn_rate_controller')
         p = self.declare_parameter
         self.enabled = p('enabled', True).value
-        # Feedforward scale on the requested yaw rate. Raise above 1.0 if the
-        # base consistently under-turns by a fixed proportion.
-        self.kff = p('kff', 1.0).value
-        self.kp = p('kp', 1.0).value
-        self.ki = p('ki', 5.0).value             # rad/s added per (rad/s * s)
-        self.i_max = p('i_max', 1.5).value       # rad/s, integral clamp
-        self.max_angular_vel = p('max_angular_vel', 3.0).value
-        # Requests below this count as "no rotation" (pass-through).
-        self.angular_deadband = p('angular_deadband', 0.05).value
-        # Minimum |command| for a turn on the spot (|v| < linear_deadband),
-        # to break static friction immediately. 0 disables it; the integral
-        # still builds while stalled.
-        self.linear_deadband = p('linear_deadband', 0.05).value
+        # Defaults from the 2026-10-28 calibration of this base;
+        # maps/turn_calibration.yaml overrides them.
+        self.kff_inplace = p('kff_inplace', 2.09).value
+        self.offset_inplace = p('offset_inplace', 0.40).value
+        self.kff_moving = p('kff_moving', 2.37).value
+        self.offset_moving = p('offset_moving', 0.09).value
         self.min_inplace_angular = p('min_inplace_angular', 0.0).value
-        # Multiply the measurement by -1 here only if the check below fires
-        # and the TF cannot be fixed.
-        self.measured_sign = p('measured_sign', 1.0).value
+        self.kp = p('kp', 0.3).value
+        self.ki = p('ki', 0.5).value
+        self.i_max = p('i_max', 0.3).value
+        # Braking when the robot turns faster than asked (see point 4).
+        self.kp_brake = p('kp_brake', 0.8).value
+        self.brake_band = p('brake_band', 0.3).value     # rad/s
+        self.i_bleed_time = p('i_bleed_time', 0.2).value  # s
+        self.max_angular_vel = p('max_angular_vel', 3.0).value
+        # |v| below this = pivot; |w| below angular_deadband = no turn.
+        self.linear_deadband = p('linear_deadband', 0.05).value
+        self.angular_deadband = p('angular_deadband', 0.05).value
         self.odom_timeout = p('odom_timeout', 0.5).value
-        # Sign check: |w_ref| and |w_meas| above these, opposite signs, for
-        # longer than sign_fault_time -> fall back to pass-through.
-        self.sign_check_ref = p('sign_check_ref', 0.3).value
-        self.sign_check_meas = p('sign_check_meas', 0.2).value
-        self.sign_fault_time = p('sign_fault_time', 0.5).value
-        # Linear stall boost (see module docstring).
-        self.stall_boost = p('stall_boost', True).value
-        self.stall_time = p('stall_time', 2.0).value          # s
-        self.stall_speed = p('stall_speed', 0.02).value       # m/s
-        self.stall_yaw_rate = p('stall_yaw_rate', 0.1).value  # rad/s
-        self.linear_boost_rate = p('linear_boost_rate', 0.1).value  # m/s/s
-        self.max_linear_boost = p('max_linear_boost', 0.15).value   # m/s
-        self.max_linear_vel = p('max_linear_vel', 0.4).value        # m/s
-        self.boost_decay_time = p('boost_decay_time', 1.0).value    # s
-        # Moving "freely" = faster than this fraction of the command; until
-        # then the boost is held, not faded.
-        self.free_fraction = p('free_fraction', 0.5).value
-        self.free_hold_time = p('free_hold_time', 0.5).value        # s
-        # After a boost, a new stall within restall_window re-boosts after
-        # only restall_time instead of the full stall_time.
-        self.restall_window = p('restall_window', 3.0).value        # s
-        self.restall_time = p('restall_time', 0.3).value            # s
 
         self.integral = 0.0
-        self.last_ref_sign = 0.0
+        self.last_sign = 0.0
         self.last_cmd_time = None
         self.yaw_rate = 0.0
         self.last_odom_time = None
-        self.wrong_sign_time = 0.0
-        self.faulted = False
-        self.linear_speed = 0.0
-        self.stalled_time = 0.0
-        self.linear_boost = 0.0
-        self.since_boost = float('inf')
-        self.free_time = 0.0
 
         self.pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.debug_pub = self.create_publisher(Vector3, '~/debug', 10)
@@ -118,67 +82,12 @@ class TurnRateController(Node):
         self.create_subscription(Odometry, 'odom', self.on_odom, 10)
         self.get_logger().info(
             f'turn rate control {"on" if self.enabled else "off"}: '
-            f'kff {self.kff} kp {self.kp} ki {self.ki} i_max {self.i_max}')
+            f'pivot {self.offset_inplace} + {self.kff_inplace}*w, '
+            f'driving {self.offset_moving} + {self.kff_moving}*w')
 
     def on_odom(self, msg):
-        self.yaw_rate = self.measured_sign * msg.twist.twist.angular.z
-        self.linear_speed = abs(msg.twist.twist.linear.x)
+        self.yaw_rate = msg.twist.twist.angular.z
         self.last_odom_time = self.get_clock().now()
-
-    def odom_fresh(self, now):
-        return (self.last_odom_time is not None and
-                (now - self.last_odom_time).nanoseconds / 1e9 <
-                self.odom_timeout)
-
-    def boost_linear(self, cmd, dt, now):
-        """Raise cmd.linear.x if the robot should be driving but is stuck."""
-        v = cmd.linear.x
-        if not (self.stall_boost and abs(v) > self.linear_deadband and
-                self.odom_fresh(now)):
-            self.stalled_time = 0.0
-            self.linear_boost = 0.0
-            return
-        moving = (self.linear_speed > self.stall_speed or
-                  abs(self.yaw_rate) > self.stall_yaw_rate)
-        if self.linear_speed > self.free_fraction * abs(v):
-            self.free_time += dt
-        else:
-            self.free_time = 0.0
-        free = self.free_time > self.free_hold_time
-        self.since_boost += dt
-        if self.linear_boost > 0.005:
-            self.since_boost = 0.0
-        if moving:
-            self.stalled_time = 0.0
-            if free:
-                self.linear_boost *= math.exp(-dt / self.boost_decay_time)
-        else:
-            self.stalled_time += dt
-            wait = (self.restall_time if self.since_boost < self.restall_window
-                    else self.stall_time)
-            if self.stalled_time > wait:
-                self.linear_boost = min(
-                    self.linear_boost + self.linear_boost_rate * dt,
-                    self.max_linear_boost)
-        if self.linear_boost > 0.005:
-            magnitude = min(abs(v) + self.linear_boost, self.max_linear_vel)
-            cmd.linear.x = math.copysign(magnitude, v)
-            if not moving:
-                self.get_logger().info(
-                    f'stuck for {self.stalled_time:.1f} s: boosting speed '
-                    f'{abs(v):.2f} -> {magnitude:.2f} m/s',
-                    throttle_duration_sec=1.0)
-
-    def passthrough(self, msg, dt, now, w_meas=float('nan')):
-        self.integral = 0.0
-        cmd = Twist()
-        cmd.linear.x, cmd.linear.y, cmd.linear.z = (
-            msg.linear.x, msg.linear.y, msg.linear.z)
-        cmd.angular.z = msg.angular.z
-        self.boost_linear(cmd, dt, now)
-        self.pub.publish(cmd)
-        self.debug_pub.publish(
-            Vector3(x=msg.angular.z, y=w_meas, z=msg.angular.z))
 
     def on_cmd(self, msg):
         now = self.get_clock().now()
@@ -188,63 +97,56 @@ class TurnRateController(Node):
                      0.2)
         self.last_cmd_time = now
 
-        w_ref = msg.angular.z
-        if not (self.enabled and not self.faulted and self.odom_fresh(now)):
-            self.passthrough(msg, dt, now)
-            return
-        w_meas = self.yaw_rate
-        if abs(w_ref) < self.angular_deadband:
-            self.last_ref_sign = 0.0
-            self.passthrough(msg, dt, now, w_meas)
-            return
-
-        # Gyro sign sanity check: a clear turn request with a clear turn the
-        # other way means positive feedback; stop correcting.
-        if (abs(w_ref) > self.sign_check_ref and
-                abs(w_meas) > self.sign_check_meas and
-                w_ref * w_meas < 0.0):
-            self.wrong_sign_time += dt
-            if self.wrong_sign_time > self.sign_fault_time:
-                self.faulted = True
-                self.get_logger().error(
-                    'measured yaw rate keeps opposing the command: check the '
-                    'IMU sign / TF (or set measured_sign). Falling back to '
-                    'pass-through until restart.')
-                self.passthrough(msg, dt, now, w_meas)
-                return
-        else:
-            self.wrong_sign_time = 0.0
-
-        # A new turn direction starts from a clean integral.
-        ref_sign = math.copysign(1.0, w_ref)
-        if ref_sign != self.last_ref_sign:
-            self.integral = 0.0
-        self.last_ref_sign = ref_sign
-
-        err = w_ref - w_meas
-        self.integral = min(max(self.integral + self.ki * err * dt,
-                                -self.i_max), self.i_max)
-        out = self.kff * w_ref + self.kp * err + self.integral
-
-        # Never command the opposite direction to the request, and stay
-        # within the base's limits. Back-calculate the integral when the
-        # output saturates so it does not wind up.
-        magnitude = abs(out) if out * w_ref > 0.0 else 0.0
-        if abs(msg.linear.x) < self.linear_deadband:
-            magnitude = max(magnitude, self.min_inplace_angular)
-        limited = min(magnitude, self.max_angular_vel)
-        if limited != magnitude or out * w_ref <= 0.0:
-            self.integral = ref_sign * limited - self.kff * w_ref \
-                - self.kp * err
-            self.integral = min(max(self.integral, -self.i_max), self.i_max)
-
-        cmd = Twist()
-        cmd.linear.x, cmd.linear.y, cmd.linear.z = (
+        out = Twist()
+        out.linear.x, out.linear.y, out.linear.z = (
             msg.linear.x, msg.linear.y, msg.linear.z)
-        cmd.angular.z = math.copysign(limited, w_ref)
-        self.boost_linear(cmd, dt, now)
-        self.pub.publish(cmd)
-        self.debug_pub.publish(Vector3(x=w_ref, y=w_meas, z=cmd.angular.z))
+        w_ref = msg.angular.z
+        odom_fresh = (self.last_odom_time is not None and
+                      (now - self.last_odom_time).nanoseconds / 1e9 <
+                      self.odom_timeout)
+
+        if not self.enabled or abs(w_ref) < self.angular_deadband:
+            self.integral = 0.0
+            self.last_sign = 0.0
+            out.angular.z = w_ref
+        else:
+            sign = math.copysign(1.0, w_ref)
+            if sign != self.last_sign:
+                self.integral = 0.0          # new turn direction
+            self.last_sign = sign
+            pivot = abs(msg.linear.x) < self.linear_deadband
+            if pivot:
+                kff, offset = self.kff_inplace, self.offset_inplace
+            else:
+                kff, offset = self.kff_moving, self.offset_moving
+            if odom_fresh:
+                # Measured rate in the requested direction; > |w_ref| means
+                # the robot is already turning faster than asked.
+                ahead = sign * self.yaw_rate - abs(w_ref)
+                fade = min(max(1.0 - ahead / self.brake_band, 0.0), 1.0)
+                w = sign * (offset * fade + kff * abs(w_ref))
+                err = w_ref - self.yaw_rate
+                if ahead < 0.0:
+                    self.integral = min(max(
+                        self.integral + self.ki * err * dt,
+                        -self.i_max), self.i_max)
+                    w += self.kp * err + self.integral
+                else:
+                    self.integral *= math.exp(-dt / self.i_bleed_time)
+                    w += self.kp_brake * err + self.integral
+            else:
+                self.integral = 0.0
+                w = sign * (offset + kff * abs(w_ref))
+            # Never turn the opposite way to the request.
+            magnitude = abs(w) if w * w_ref > 0.0 else 0.0
+            if pivot:
+                magnitude = max(magnitude, self.min_inplace_angular)
+            out.angular.z = sign * min(magnitude, self.max_angular_vel)
+
+        self.pub.publish(out)
+        self.debug_pub.publish(Vector3(
+            x=w_ref, y=self.yaw_rate if odom_fresh else float('nan'),
+            z=out.angular.z))
 
 
 def main():

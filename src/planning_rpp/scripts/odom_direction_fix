@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Give the wheel-odometry speed the right sign when the robot reverses.
+
+The Wave Rover's `dist_centre` feedback only ever increases: driving
+backwards is reported as driving forwards (pivots read ~0, which is fine).
+Recorded 2026-10-28 (run_0903_224220): during a 0.30 m back-up the wheel
+odometry moved the robot +0.30 m while the LiDAR showed -0.33 m, a 63 cm
+localization error in 3.5 s that AMCL could not recover from.
+
+This node sits between the driver and the EKF:
+
+    waverover_driver --/odom/raw--> odom_direction_fix --/odom/raw_signed--> EKF
+
+and sets  twist.linear.x = sign * |twist.linear.x|,  where `sign` is the
+direction of the last clearly non-zero commanded linear velocity on
+/cmd_vel (kept for hold_time after the command drops to zero, while the
+robot coasts). Everything else in the message passes through unchanged
+(the EKF only fuses linear.x from this source).
+"""
+import math
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+
+class OdomDirectionFix(Node):
+
+    def __init__(self):
+        super().__init__('odom_direction_fix')
+        # |commanded v| above this sets the direction (m/s).
+        self.cmd_threshold = self.declare_parameter(
+            'cmd_threshold', 0.01).value
+        # Keep the last direction this long after the command goes to ~0.
+        self.hold_time = self.declare_parameter('hold_time', 1.0).value
+        self.sign = 1.0
+        self.last_dir_time = None
+        self.flips = 0
+        self.pub = self.create_publisher(Odometry, 'odom_out', 10)
+        self.create_subscription(Odometry, 'odom_in', self.on_odom,
+                                 qos_profile_sensor_data)
+        self.create_subscription(Twist, 'cmd_vel', self.on_cmd, 10)
+        self.get_logger().info('signing wheel odometry by commanded direction')
+
+    def on_cmd(self, msg):
+        v = msg.linear.x
+        now = self.get_clock().now()
+        if abs(v) > self.cmd_threshold:
+            sign = math.copysign(1.0, v)
+            if sign < 0.0 and self.sign > 0.0:
+                self.flips += 1
+                self.get_logger().info(
+                    'reversing: wheel speed now treated as backwards',
+                    throttle_duration_sec=2.0)
+            self.sign = sign
+            self.last_dir_time = now
+        elif (self.last_dir_time is not None and
+              (now - self.last_dir_time).nanoseconds / 1e9 > self.hold_time):
+            self.sign = 1.0       # stopped: speed is ~0 anyway
+
+    def on_odom(self, msg):
+        msg.twist.twist.linear.x = self.sign * abs(msg.twist.twist.linear.x)
+        self.pub.publish(msg)
+
+
+def main():
+    rclpy.init()
+    node = OdomDirectionFix()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,5 @@
+# map->arena transform, written by calibrate_arena from squares S F X.
+# Loaded by planning.launch.py; re-run after rebuilding the map.
+arena_x: 0.4853
+arena_y: 1.5557
+arena_yaw: -2.0519

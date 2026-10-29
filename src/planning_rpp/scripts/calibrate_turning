@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Measure how much the base really turns for a commanded yaw rate.
+
+Run with ONLY robot.launch.py running (not planning.launch.py, which would
+also send velocity commands):
+
+    ros2 run planning_rpp calibrate_turning            # pivot test only
+    ros2 run planning_rpp calibrate_turning --moving   # + turns while driving
+
+Pivot test: the robot turns on the spot at a series of commanded yaw rates
+(alternating direction so it ends up roughly where it started). Give it a
+clear circle of ~0.5 m around it.
+
+--moving: additionally drives slow S-curves at 0.15 m/s; needs ~1.5 m of
+clear floor straight ahead and ~0.5 m to each side.
+
+The real turn rate comes from the IMU gyro. The base behaves like a
+deadband plus a gain, so a straight line  actual = (cmd - offset) / kff  is
+fitted to the steps where it turned. Results are saved to
+~/rb3302_final_proj_code/student_ws/maps/turn_calibration.yaml (or --out
+PATH), which planning.launch.py loads into turn_rate_controller:
+    offset_inplace, kff_inplace   pivoting
+    offset_moving,  kff_moving    driving (--moving only)
+Ctrl+C stops the robot at any time.
+"""
+import math
+import os
+import sys
+import time
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.signals import SignalHandlerOptions
+from rclpy.utilities import remove_ros_args
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
+
+PIVOT_CMDS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0]
+MOVING_V = 0.15
+MOVING_CMDS = [0.2, 0.3, 0.4, 0.6]
+STEP_TIME = 2.5        # s per step
+MEASURE_TIME = 1.2     # s at the end of each step that is averaged
+REST_TIME = 1.0        # s stopped between steps
+TURNING = 0.15         # rad/s: below this the base is not really turning
+# H30 IMU is mounted upside down (FRD): its z rate is the negative of the
+# robot's yaw rate (verified against scan matching in the 0903 recording).
+IMU_SIGN = -1.0
+DEFAULT_OUT = os.path.join(
+    os.path.expanduser('~'), 'rb3302_final_proj_code', 'student_ws', 'maps',
+    'turn_calibration.yaml')
+
+
+class Calibrator(Node):
+
+    def __init__(self):
+        super().__init__('calibrate_turning')
+        self.pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.samples = []      # (time, yaw_rate)
+        self.speed = 0.0
+        # Best-effort QoS: the IMU driver publishes best-effort, and a
+        # reliable subscriber would receive nothing from it.
+        self.create_subscription(Imu, 'imu_data_ros', self.on_imu,
+                                 qos_profile_sensor_data)
+        self.create_subscription(Odometry, 'odom/raw', self.on_odom,
+                                 qos_profile_sensor_data)
+
+    def on_imu(self, msg):
+        self.samples.append((time.monotonic(),
+                             IMU_SIGN * msg.angular_velocity.z))
+
+    def on_odom(self, msg):
+        self.speed = msg.twist.twist.linear.x
+
+    def send(self, v, w):
+        t = Twist()
+        t.linear.x = float(v)
+        t.angular.z = float(w)
+        self.pub.publish(t)
+
+    def hold(self, v, w, seconds):
+        """Command (v, w) at 20 Hz for `seconds`; return mean yaw rate and
+        speed over the last MEASURE_TIME seconds."""
+        start = time.monotonic()
+        speeds = []
+        while time.monotonic() - start < seconds:
+            self.send(v, w)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if time.monotonic() - start > seconds - MEASURE_TIME:
+                speeds.append(self.speed)
+        cutoff = time.monotonic() - MEASURE_TIME
+        rates = [r for t, r in self.samples if t >= cutoff]
+        self.samples = self.samples[-2000:]
+        rate = sum(rates) / len(rates) if rates else float('nan')
+        speed = sum(speeds) / len(speeds) if speeds else float('nan')
+        return rate, speed
+
+    def stop(self):
+        for _ in range(10):
+            self.send(0.0, 0.0)
+            time.sleep(0.02)
+
+    def wait_for_imu(self):
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end and not self.samples:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        return bool(self.samples)
+
+    def run_steps(self, v, cmds, label):
+        rows = []
+        sign = 1.0
+        for c in cmds:
+            w_cmd = sign * c
+            rate, speed = self.hold(v, w_cmd, STEP_TIME)
+            self.hold(0.0, 0.0, REST_TIME)
+            ratio = rate / w_cmd if w_cmd else float('nan')
+            print(f'  {label} cmd {w_cmd:+.2f} rad/s -> actual {rate:+.2f} '
+                  f'rad/s  (ratio {ratio:4.2f}'
+                  + (f', speed {speed:.2f} m/s)' if v else ')'))
+            rows.append((c, rate * sign, speed))
+            sign = -sign
+        return rows
+
+
+def fit(rows):
+    """Least-squares  actual = (cmd - offset) / kff  over steps that turned.
+    Returns (kff, offset) or None."""
+    pts = [(c, r) for c, r in rows if r >= TURNING / 2]
+    if len(pts) < 2:
+        return None
+    n = len(pts)
+    mx = sum(c for c, _ in pts) / n
+    my = sum(r for _, r in pts) / n
+    sxx = sum((c - mx) ** 2 for c, _ in pts)
+    if sxx <= 0:
+        return None
+    gain = sum((c - mx) * (r - my) for c, r in pts) / sxx
+    if gain <= 0:
+        return None
+    offset = mx - my / gain
+    return (round(min(max(1.0 / gain, 1.0), 5.0), 2),
+            round(min(max(offset, 0.0), 1.5), 2))
+
+
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return float('nan')
+    return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+
+def main():
+    argv = remove_ros_args(sys.argv)[1:]
+    moving = '--moving' in argv
+    out = DEFAULT_OUT
+    if '--out' in argv:
+        out = argv[argv.index('--out') + 1]
+
+    # Keep ROS alive on Ctrl+C so the stop command can still be sent.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    node = Calibrator()
+    try:
+        if not node.wait_for_imu():
+            print('No IMU data on /imu_data_ros. Is robot.launch.py running?')
+            return 1
+        print('Make sure planning.launch.py is NOT running and the robot has '
+              'a clear ~0.5 m circle around it'
+              + (' and ~1.5 m clear straight ahead.' if moving else '.'))
+        input('Press Enter to start (Ctrl+C stops the robot at any time)... ')
+
+        print('Pivot test:')
+        pivot = node.run_steps(0.0, PIVOT_CMDS, 'pivot ')
+        result = {}
+        f = fit([(c, r) for c, r, _ in pivot])
+        if f is None:
+            print('The robot never pivoted reliably, even at '
+                  f'{PIVOT_CMDS[-1]} rad/s. Check the base and battery.')
+        else:
+            result['kff_inplace'], result['offset_inplace'] = f
+
+        if moving:
+            print(f'Driving test at {MOVING_V} m/s:')
+            drive = node.run_steps(MOVING_V, MOVING_CMDS, 'moving')
+            f = fit([(c, r) for c, r, _ in drive])
+            if f is None:
+                print('Not enough turning while driving to fit a model.')
+            else:
+                result['kff_moving'], result['offset_moving'] = f
+        node.stop()
+    except KeyboardInterrupt:
+        node.stop()
+        print('\nstopped')
+        return 1
+    finally:
+        node.stop()
+
+    if not result:
+        print('Nothing to save.')
+        return 1
+    print('\nResult:')
+    for k, v in result.items():
+        print(f'  {k}: {v}')
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, 'w') as f:
+        f.write('# Written by calibrate_turning; loaded by planning.launch.py\n')
+        f.write('turn_rate_controller:\n  ros__parameters:\n')
+        for k, v in result.items():
+            f.write(f'    {k}: {v}\n')
+    print(f'Saved to {out}. Restart planning.launch.py to use it.')
+    node.destroy_node()
+    rclpy.try_shutdown()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

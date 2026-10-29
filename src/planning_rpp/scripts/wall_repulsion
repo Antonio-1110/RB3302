@@ -45,6 +45,7 @@ from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist, Vector3
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformListener
 
@@ -73,7 +74,13 @@ class WallRepulsion(Node):
         # Walls closer than this to the footprint start pushing.
         self.influence = p('influence_dist', 0.05).value
         # Max correction (rad/s) when a wall touches the footprint.
-        self.gain = p('gain', 0.8).value
+        # 0.4 (was 0.8): at 0.8 it added up to -0.75 rad/s on top of RPP's
+        # own correction and fed the turn overshoot (2026-10-29 recording).
+        self.gain = p('gain', 0.4).value
+        # How fast the correction may change (rad/s per s), so it eases in
+        # and out instead of jerking the turn request (it is applied after
+        # the velocity smoother, so nothing else limits it).
+        self.max_rate = p('max_correction_rate', 2.0).value
         # Max share of a commanded turn the correction may take away when it
         # pushes against that turn (0.5 = at most halve it, never reverse).
         self.max_oppose = p('max_oppose_fraction', 0.5).value
@@ -91,11 +98,16 @@ class WallRepulsion(Node):
         self.w_left = 0.0
         self.w_right = 0.0
         self.last_scan_time = None
+        self.correction = 0.0
+        self.last_cmd_time = None
 
         self.pub = self.create_publisher(Twist, 'cmd_vel_out', 10)
         self.debug_pub = self.create_publisher(Vector3, '~/debug', 10)
         self.create_subscription(Twist, 'cmd_vel_in', self.on_cmd, 10)
-        self.create_subscription(LaserScan, 'scan', self.on_scan, 10)
+        # Best-effort QoS: a reliable subscriber receives nothing from a
+        # best-effort LiDAR publisher (silently), so the node never acted.
+        self.create_subscription(LaserScan, 'scan', self.on_scan,
+                                 qos_profile_sensor_data)
         self.get_logger().info(
             f'wall repulsion {"on" if self.enabled else "off"}: '
             f'influence {self.influence} m, gain {self.gain} rad/s')
@@ -161,6 +173,11 @@ class WallRepulsion(Node):
 
     def on_cmd(self, msg):
         now = self.get_clock().now()
+        dt = 0.05
+        if self.last_cmd_time is not None:
+            dt = min(max((now - self.last_cmd_time).nanoseconds / 1e9, 0.0),
+                     0.2)
+        self.last_cmd_time = now
         correction = 0.0
         if (self.enabled and msg.linear.x > self.min_linear and
                 self.scan_fresh(now)):
@@ -171,6 +188,10 @@ class WallRepulsion(Node):
                 limit = self.max_oppose * abs(w_cmd)
                 correction = math.copysign(min(abs(correction), limit),
                                            correction)
+        # Ease towards the target correction at max_correction_rate.
+        step = self.max_rate * dt
+        self.correction += min(max(correction - self.correction, -step), step)
+        correction = self.correction
         out = Twist()
         out.linear = msg.linear
         out.angular.x, out.angular.y = msg.angular.x, msg.angular.y

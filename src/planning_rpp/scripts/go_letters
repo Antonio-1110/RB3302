@@ -18,9 +18,29 @@ Squares are 60 cm cubes laid out as:
     S T U V W X     (south)
 
 Centres are expressed in the 'arena' frame (origin at the SW inner corner,
-X = East, Y = North) published by planning.launch.py, transformed into the
-map frame, and sent as one FollowWaypoints goal. The pause at each square is
-waypoint_follower's wait_at_waypoint.waypoint_pause_duration.
+X = East, Y = North) published by planning.launch.py and transformed into the
+map frame. Squares are sent to Nav2's navigate_to_pose one at a time, with a
+PAUSE_TIME stop at each. If a square fails (e.g. the planner reports "Start
+occupied" because the robot ended up against a wall, which Nav2's default
+behaviour tree does not recover from), the robot backs up BACKUP_DIST with
+Nav2's backup behaviour and retries, up to ATTEMPTS times, before skipping
+that square.
+
+Leaving tight squares: before each leg the path is planned first. If it
+leaves behind the robot (> EXIT_BEHIND_DEG off its heading) AND the live scan
+shows a pivot here would clip a wall AND the scan shows a clear strip behind
+the robot, it reverses (at most BACKOUT_MAX, keeping BACKOUT_MARGIN from
+whatever is behind) so the turn happens with more room. Otherwise it simply
+pivots as usual.
+
+Targets: each square centre is nudged up to SNAP_RADIUS to the most open
+point on the map (furthest from any wall), because some centres sit very
+close to walls on the map (N: 0.15 m from a wall). With
+the 5 cm goal tolerance the robot still ends up fully inside the square.
+
+Start heading: after --start, if the scan shows the robot can pivot safely,
+it turns SETTLE_DEG each way and back so AMCL can lock its heading from the
+LiDAR before driving (the placed bearing is only +-45 deg accurate).
 """
 import math
 import signal
@@ -33,10 +53,17 @@ from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from rclpy.utilities import remove_ros_args
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+import numpy as np
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
-from nav2_msgs.action import FollowWaypoints
+from action_msgs.msg import GoalStatus
+from builtin_interfaces.msg import Duration as DurationMsg
+from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose, Spin
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformListener
 
@@ -66,6 +93,44 @@ AMCL_ACTIVE_TIMEOUT = 30.0
 # publishing it again.
 START_POSE_TF_WAIT = 3.0
 START_POSE_ATTEMPTS = 5
+# Stop at each square (s).
+PAUSE_TIME = 3.5
+# Tries per square; between tries the robot backs up BACKUP_DIST (m) at
+# BACKUP_SPEED (m/s), giving up on the back-up after BACKUP_TIMEOUT (s).
+ATTEMPTS = 3
+BACKUP_DIST = 0.10
+BACKUP_SPEED = 0.12
+BACKUP_TIMEOUT = 5
+
+
+# Robot footprint half-extents (m), as in nav2_params.yaml, and the radius
+# its corners sweep when pivoting.
+# Real robot: 20 x 20 cm about its turning centre (measured 2026-10-29).
+FOOT_FRONT = 0.10
+FOOT_BACK = 0.10
+FOOT_HALF_WIDTH = 0.10
+PIVOT_RADIUS = math.hypot(max(FOOT_FRONT, FOOT_BACK), FOOT_HALF_WIDTH)
+PIVOT_MARGIN = 0.03        # extra clearance wanted around the sweep circle
+# Back out of tight squares (see module docstring).
+EXIT_BEHIND_DEG = 120.0    # path leaves this far off the robot's heading
+EXIT_LOOKAHEAD = 0.30      # m along the planned path used for its direction
+BACKOUT_MAX = 0.30         # m
+BACKOUT_MIN = 0.10         # m; less room than this -> do not back up
+BACKOUT_MARGIN = 0.08      # m kept from the nearest thing behind
+REAR_STRIP_MARGIN = 0.03   # m added to each side of the rear check strip
+# Start-heading settle: pivot this far each way, then back.
+SETTLE_DEG = 30.0
+SETTLE_TIMEOUT = 8         # s per pivot
+SCAN_TIMEOUT = 0.5         # s; older scans are not trusted
+# Target nudge (see module docstring).
+SNAP_RADIUS = 0.07         # m; + 0.05 goal tolerance < 0.145 m allowed
+SNAP_STEP = 0.01           # m search grid
+SNAP_MIN_GAIN = 0.005      # m; only move for a real clearance gain
+MAP_OCCUPIED = 65          # occupancy value counted as a wall
+
+
+class StopRequested(Exception):
+    """Ctrl+C / kill while a Nav2 goal was active (already cancelled)."""
 
 
 def letter_to_arena(letter):
@@ -97,7 +162,22 @@ class GoLetters(Node):
         super().__init__('go_letters')
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.client = ActionClient(self, FollowWaypoints, 'follow_waypoints')
+        self.nav_client = ActionClient(self, NavigateToPose,
+                                       'navigate_to_pose')
+        self.backup_client = ActionClient(self, BackUp, 'backup')
+        self.spin_client = ActionClient(self, Spin, 'spin')
+        self.plan_client = ActionClient(self, ComputePathToPose,
+                                        'compute_path_to_pose')
+        self.scan = None
+        self.scan_time = None
+        self.laser_tf = None
+        self.create_subscription(LaserScan, 'scan', self.on_scan,
+                                 qos_profile_sensor_data)
+        self.map = None
+        self.create_subscription(
+            OccupancyGrid, 'map', self.on_map,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE))
         self.initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, 'initialpose', 10)
         self.nomotion_client = self.create_client(
@@ -106,9 +186,241 @@ class GoLetters(Node):
             Trigger, NAV2_ACTIVE_SERVICE)
         self.amcl_state_client = self.create_client(
             GetState, AMCL_STATE_SERVICE)
-        # The FollowWaypoints goal lives in waypoint_follower, not here:
-        # exiting does not stop the robot unless the goal is cancelled.
+        # Nav2 goals live in Nav2, not here: exiting does not stop the robot
+        # unless the active goal is cancelled.
         self.send_future = None
+        # Set by Ctrl+C / kill while a goal is active: the wait loops notice
+        # it and cancel the goal. (Raising KeyboardInterrupt inside rclpy's
+        # spin instead leaves the executor broken, so the cancel fails.)
+        self.stop_requested = False
+        # Live printout while driving: commanded vs measured velocity.
+        self.cmd = None        # last /cmd_vel sent to the base
+        self.odom = None       # last /odom (EKF) twist
+        self.target = ''
+        self.create_subscription(Twist, 'cmd_vel', self.on_cmd_vel, 10)
+        self.create_subscription(Odometry, 'odom', self.on_odom, 10)
+        self.status_timer = None
+
+    def on_map(self, msg):
+        self.map = msg
+
+    def wall_cells(self):
+        """Map-frame (x, y) of every occupied cell. Unknown cells are not
+        walls to the planner (allow_unknown), so they are not counted."""
+        m = self.map
+        w, h = m.info.width, m.info.height
+        grid = np.array(m.data, dtype=np.int16).reshape(h, w)
+        rows, cols = np.nonzero(grid >= MAP_OCCUPIED)
+        res = m.info.resolution
+        # Cell centres; the map origin has no rotation in map_server maps.
+        xs = m.info.origin.position.x + (cols + 0.5) * res
+        ys = m.info.origin.position.y + (rows + 0.5) * res
+        return np.column_stack((xs, ys))
+
+    def snap_target(self, letter, x, y, walls):
+        """Most open point within SNAP_RADIUS of (x, y)."""
+        near = walls[(np.abs(walls[:, 0] - x) < 0.6) &
+                     (np.abs(walls[:, 1] - y) < 0.6)]
+        if len(near) == 0:
+            return x, y
+        steps = np.arange(-SNAP_RADIUS, SNAP_RADIUS + 1e-9, SNAP_STEP)
+        dx, dy = np.meshgrid(steps, steps)
+        keep = np.hypot(dx, dy) <= SNAP_RADIUS + 1e-9
+        cx = x + dx[keep]
+        cy = y + dy[keep]
+        # Clearance of each candidate = distance to its nearest wall cell.
+        d = np.sqrt(((cx[:, None] - near[None, :, 0]) ** 2) +
+                    ((cy[:, None] - near[None, :, 1]) ** 2)).min(axis=1)
+        here = np.sqrt(((x - near[:, 0]) ** 2) + ((y - near[:, 1]) ** 2)).min()
+        best = int(np.argmax(d))
+        if d[best] < here + SNAP_MIN_GAIN:
+            return x, y
+        nx, ny = float(cx[best]), float(cy[best])
+        self.get_logger().info(
+            f'{letter}: target nudged {math.hypot(nx - x, ny - y) * 100:.0f} '
+            f'cm to the most open spot; wall clearance {here:.2f} -> '
+            f'{d[best]:.2f} m')
+        return nx, ny
+
+    def on_scan(self, msg):
+        self.scan = msg
+        self.scan_time = self.get_clock().now()
+
+    def scan_points(self):
+        """Latest scan as (x, y) points in base_link, or None if no fresh
+        scan / transform. Points inside the footprint are dropped."""
+        if self.scan is None or (
+                (self.get_clock().now() - self.scan_time).nanoseconds / 1e9
+                > SCAN_TIMEOUT):
+            return None
+        if self.laser_tf is None:
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    'base_link', self.scan.header.frame_id, Time())
+            except Exception:  # noqa: BLE001 - tf2 raises several types
+                return None
+            q = t.transform.rotation
+            x, y, z, w = q.x, q.y, q.z, q.w
+            rot = ((1 - 2 * (y * y + z * z), 2 * (x * y - z * w)),
+                   (2 * (x * y + z * w), 1 - 2 * (x * x + z * z)))
+            self.laser_tf = (rot, t.transform.translation.x,
+                             t.transform.translation.y)
+        rot, tx, ty = self.laser_tf
+        s = self.scan
+        pts = []
+        for i, r in enumerate(s.ranges):
+            if not (s.range_min <= r <= s.range_max) or math.isinf(r):
+                continue
+            a = s.angle_min + i * s.angle_increment
+            lx, ly = r * math.cos(a), r * math.sin(a)
+            px = rot[0][0] * lx + rot[0][1] * ly + tx
+            py = rot[1][0] * lx + rot[1][1] * ly + ty
+            if (-FOOT_BACK <= px <= FOOT_FRONT and
+                    abs(py) <= FOOT_HALF_WIDTH):
+                continue    # inside the footprint: self-hit / noise
+            pts.append((px, py))
+        return pts
+
+    @staticmethod
+    def pivot_is_clear(pts):
+        limit = PIVOT_RADIUS + PIVOT_MARGIN
+        return all(math.hypot(x, y) > limit for x, y in pts)
+
+    @staticmethod
+    def rear_clearance(pts):
+        """Free distance behind the rear edge, in a strip as wide as the
+        robot plus a margin each side."""
+        half = FOOT_HALF_WIDTH + REAR_STRIP_MARGIN
+        behind = [-FOOT_BACK - x for x, y in pts
+                  if x < -FOOT_BACK and abs(y) <= half]
+        return min(behind) if behind else float('inf')
+
+    def robot_pose(self):
+        try:
+            t = self.tf_buffer.lookup_transform(MAP_FRAME, 'base_link', Time())
+        except Exception:  # noqa: BLE001
+            return None
+        return (t.transform.translation.x, t.transform.translation.y,
+                yaw_of(t.transform.rotation))
+
+    def exit_angle(self, pose):
+        """Angle (rad) between the robot's heading and the direction the
+        planned path to `pose` leaves in; None if it cannot be planned."""
+        here = self.robot_pose()
+        if here is None or not self.plan_client.server_is_ready():
+            return None
+        goal = ComputePathToPose.Goal()
+        goal.goal = pose
+        goal.use_start = False
+        send = self.plan_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send, timeout_sec=2.0)
+        if not send.done() or not send.result().accepted:
+            return None
+        res = send.result().get_result_async()
+        rclpy.spin_until_future_complete(self, res, timeout_sec=3.0)
+        if not res.done():
+            return None
+        poses = res.result().result.path.poses
+        x0, y0, yaw = here
+        for p in poses:
+            dx = p.pose.position.x - x0
+            dy = p.pose.position.y - y0
+            if math.hypot(dx, dy) >= EXIT_LOOKAHEAD:
+                d = math.atan2(dy, dx) - yaw
+                return math.atan2(math.sin(d), math.cos(d))
+        return None
+
+    def prepare_leg(self, letter, pose):
+        """Back out first if the way out is behind and pivoting here would
+        clip a wall -- only as far as the scan shows is clear behind."""
+        angle = self.exit_angle(pose)
+        if angle is None or abs(angle) < math.radians(EXIT_BEHIND_DEG):
+            return
+        pts = self.scan_points()
+        if pts is None:
+            self.get_logger().warn('no fresh scan; not backing out')
+            return
+        if self.pivot_is_clear(pts):
+            return                      # enough room to just turn here
+        room = self.rear_clearance(pts) - BACKOUT_MARGIN
+        dist = min(BACKOUT_MAX, room)
+        if dist < BACKOUT_MIN:
+            self.get_logger().warn(
+                f'{letter}: way out is behind and a pivot here is tight, but '
+                f'only {max(room, 0.0):.2f} m clear behind; pivoting anyway')
+            return
+        self.get_logger().info(
+            f'{letter}: way out is {math.degrees(abs(angle)):.0f} deg behind '
+            f'and a pivot here would clip a wall; backing out {dist:.2f} m')
+        self.back_up(dist)
+
+    def settle_heading(self):
+        """Pivot +-SETTLE_DEG so AMCL can fix the start heading."""
+        if not self.spin_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().warn('spin behaviour not available; '
+                                   'skipping heading settle')
+            return
+        pts = None
+        for _ in range(20):             # wait up to ~1 s for a scan
+            pts = self.scan_points()
+            if pts is not None:
+                break
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if pts is None or not self.pivot_is_clear(pts):
+            self.get_logger().info('not enough room to pivot at the start; '
+                                   'skipping heading settle')
+            return
+        self.get_logger().info(
+            f'settling start heading: pivoting +-{SETTLE_DEG:.0f} deg')
+        a = math.radians(SETTLE_DEG)
+        for yaw in (a, -2.0 * a, a):
+            goal = Spin.Goal()
+            goal.target_yaw = yaw
+            goal.time_allowance = DurationMsg(sec=SETTLE_TIMEOUT)
+            if self.run_action(self.spin_client, goal) != \
+                    GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().warn('settle pivot did not complete; '
+                                       'continuing')
+                break
+        if self.nomotion_client.wait_for_service(timeout_sec=2.0):
+            for _ in range(NOMOTION_UPDATES // 2):
+                self.call(self.nomotion_client, Empty.Request())
+                self.sleep(0.1)
+
+    def on_cmd_vel(self, msg):
+        self.cmd = msg
+
+    def on_odom(self, msg):
+        self.odom = msg.twist.twist
+
+    def print_status(self):
+        if not self.target:
+            return
+        if self.cmd is None:
+            cmd = 'cmd  (none yet)'
+        else:
+            cmd = (f'cmd  v {self.cmd.linear.x:+.2f} m/s  '
+                   f'w {self.cmd.angular.z:+.2f} rad/s')
+        if self.odom is None:
+            act = 'actual (no /odom)'
+        else:
+            act = (f'actual v {self.odom.linear.x:+.2f} m/s  '
+                   f'w {self.odom.angular.z:+.2f} rad/s')
+        self.get_logger().info(f'-> {self.target} | {cmd} | {act}')
+
+    def wait_future(self, future):
+        """Spin until `future` is done; False if a stop was requested."""
+        while not future.done():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.stop_requested:
+                return False
+        return True
+
+    def on_signal(self, signum, frame):
+        if self.send_future is not None and not self.stop_requested:
+            self.stop_requested = True     # handled by the wait loops
+        else:
+            raise KeyboardInterrupt        # no goal active, or 2nd Ctrl+C
 
     def cancel_active_goal(self):
         """Cancel the waypoint goal (if any) so the robot stops."""
@@ -280,6 +592,17 @@ class GoLetters(Node):
         arena_tf = self.arena_to_map()
         points = [self.to_map(arena_tf, *letter_to_arena(letter))
                   for letter in letters]
+        # Wait briefly for the (latched) map, then nudge each target off the
+        # walls.
+        end = self.get_clock().now() + Duration(seconds=5.0)
+        while self.map is None and self.get_clock().now() < end:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.map is None:
+            self.get_logger().warn('no /map received; using square centres')
+        else:
+            walls = self.wall_cells()
+            points = [self.snap_target(letter, x, y, walls)
+                      for letter, (x, y) in zip(letters, points)]
 
         poses = []
         heading = 0.0
@@ -304,49 +627,114 @@ class GoLetters(Node):
             poses.append(pose)
         return poses
 
-    def run(self, letters):
+    def run_action(self, client, goal):
+        """Send `goal`, wait for the result and return its GoalStatus
+        (STATUS_ABORTED if rejected). Raises StopRequested, after cancelling
+        the goal, if Ctrl+C / kill arrives meanwhile."""
+        send = client.send_goal_async(goal)
+        self.send_future = send
+        if not self.wait_future(send):
+            self.cancel_active_goal()
+            self.send_future = None
+            raise StopRequested
+        handle = send.result()
+        if not handle.accepted:
+            self.send_future = None
+            return GoalStatus.STATUS_ABORTED
+        result = handle.get_result_async()
+        if not self.wait_future(result):
+            self.cancel_active_goal()
+            self.send_future = None
+            raise StopRequested
+        self.send_future = None
+        return result.result().status
+
+    def back_up(self, dist=BACKUP_DIST):
+        if not self.backup_client.server_is_ready():
+            self.get_logger().warn('backup behaviour not available; '
+                                   'continuing without backing up')
+            return
+        goal = BackUp.Goal()
+        goal.target.x = float(dist)
+        goal.speed = BACKUP_SPEED
+        goal.time_allowance = DurationMsg(sec=BACKUP_TIMEOUT)
+        status = self.run_action(self.backup_client, goal)
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().warn(
+                'back-up did not complete (blocked behind?); retrying anyway')
+
+    def go_to(self, letter, pose):
+        """Drive to one square, retrying with a back-up in between.
+        Returns True if reached."""
+        self.prepare_leg(letter, pose)
+        for attempt in range(1, ATTEMPTS + 1):
+            goal = NavigateToPose.Goal()
+            pose.header.stamp = self.get_clock().now().to_msg()
+            goal.pose = pose
+            self.target = letter
+            status = self.run_action(self.nav_client, goal)
+            self.target = ''
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                return True
+            if attempt < ATTEMPTS:
+                pts = self.scan_points()
+                room = (self.rear_clearance(pts) - BACKOUT_MARGIN
+                        if pts is not None else 0.0)
+                dist = min(BACKUP_DIST, room)
+                if dist >= 0.05:
+                    self.get_logger().warn(
+                        f'{letter}: attempt {attempt}/{ATTEMPTS} failed; '
+                        f'backing up {dist:.2f} m and retrying')
+                    self.back_up(dist)
+                else:
+                    self.get_logger().warn(
+                        f'{letter}: attempt {attempt}/{ATTEMPTS} failed; no '
+                        'clear room behind (or no scan), retrying in place')
+        return False
+
+    def run(self, letters, settle=False):
         poses = self.build_poses(letters)
         for letter, p in zip(letters, poses):
             self.get_logger().info(
                 f'{letter}: map ({p.pose.position.x:.2f}, '
                 f'{p.pose.position.y:.2f})')
 
-        if not self.client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error('follow_waypoints action not available')
+        if not self.nav_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error('navigate_to_pose action not available')
             return False
+        self.backup_client.wait_for_server(timeout_sec=5.0)
+        self.plan_client.wait_for_server(timeout_sec=5.0)
         self.wait_for_nav2_active()
 
-        goal = FollowWaypoints.Goal()
-        goal.poses = poses
-
-        def on_feedback(msg):
-            i = msg.feedback.current_waypoint
-            if 0 <= i < len(letters):
-                self.get_logger().info(f'heading to {letters[i]}',
-                                       throttle_duration_sec=2.0)
-
-        send = self.client.send_goal_async(goal, feedback_callback=on_feedback)
-        self.send_future = send
-        rclpy.spin_until_future_complete(self, send)
-        handle = send.result()
-        if not handle.accepted:
-            self.get_logger().error(
-                'waypoint goal rejected; is waypoint_follower active? '
-                '(ros2 lifecycle get /waypoint_follower)')
+        # Print commanded vs measured velocity twice a second while driving.
+        self.status_timer = self.create_timer(0.5, self.print_status)
+        missed = []
+        try:
+            if settle:
+                self.settle_heading()
+            for i, (letter, pose) in enumerate(zip(letters, poses)):
+                self.get_logger().info(
+                    f'heading to {letter} ({i + 1}/{len(letters)})')
+                if self.go_to(letter, pose):
+                    self.get_logger().info(
+                        f'reached {letter}; pausing {PAUSE_TIME:.1f} s')
+                    self.sleep(PAUSE_TIME)
+                else:
+                    self.get_logger().error(
+                        f'{letter}: failed {ATTEMPTS} times, skipping it')
+                    missed.append(letter)
+        except StopRequested:
+            self.get_logger().warn('stopped by user')
             return False
+        finally:
+            self.status_timer.cancel()
+            self.target = ''
 
-        done = handle.get_result_async()
-        rclpy.spin_until_future_complete(self, done)
-        self.send_future = None   # finished: nothing left to cancel
-        missed = list(done.result().result.missed_waypoints)
         if missed:
-            idx = [getattr(m, 'index', m) for m in missed]
-            self.get_logger().warn(
-                'missed: ' + ' '.join(letters[i] for i in idx))
+            self.get_logger().warn('missed: ' + ' '.join(missed))
             return False
         self.get_logger().info('all squares reached')
         return True
-
 
 def main():
     argv = remove_ros_args(sys.argv)[1:]
@@ -374,21 +762,25 @@ def main():
     # Keep the ROS context alive on Ctrl+C so the goal can still be
     # cancelled; treat `kill` (SIGTERM) the same as Ctrl+C.
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
-    signal.signal(signal.SIGTERM, signal.default_int_handler)
     node = GoLetters()
+    # Ctrl+C / kill during a run cancels the goal so the robot stops.
+    signal.signal(signal.SIGINT, node.on_signal)
+    signal.signal(signal.SIGTERM, node.on_signal)
     try:
         ok = True
         if start is not None:
             node.set_start(*start)
         if letters:
-            ok = node.run(letters)
+            ok = node.run(letters, settle=start is not None)
     except (RuntimeError, KeyboardInterrupt) as e:
         node.get_logger().error(str(e) or 'interrupted')
         ok = False
-        try:
-            node.cancel_active_goal()
-        except KeyboardInterrupt:
-            node.get_logger().error('cancel aborted; robot may still move')
+        if node.send_future is not None:
+            try:
+                node.cancel_active_goal()
+            except Exception:  # noqa: BLE001 - last resort, report it
+                node.get_logger().error(
+                    'cancel failed; stop the robot manually')
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
