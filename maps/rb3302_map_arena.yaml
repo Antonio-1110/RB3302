@@ -1,5 +1,9 @@
 # map->arena transform, written by calibrate_arena from squares S F X.
 # Loaded by planning.launch.py; re-run after rebuilding the map.
-arena_x: 0.4853
-arena_y: 1.5557
+# 2026-10-30: shifted 9.7 cm south by hand. The S/F/X fit was done facing N
+# with the old URDF (LiDAR at -0.052 instead of +0.045), which put every
+# pose 9.7 cm ahead. Was x 0.4853, y 1.5557. Re-run calibrate_arena to
+# replace this.
+arena_x: 0.3993
+arena_y: 1.6006
 arena_yaw: -2.0519

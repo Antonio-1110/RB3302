@@ -34,12 +34,13 @@ whatever is behind) so the turn happens with more room. Otherwise it simply
 pivots as usual.
 
 Targets: each square centre is nudged up to SNAP_RADIUS to the most open
-point on the map (furthest from any wall), because some centres sit very
-close to walls on the map (N: 0.15 m from a wall). With
-the 5 cm goal tolerance the robot still ends up fully inside the square.
+point on the map (furthest from any wall), only as a safety margin: with a
+correct arena calibration the centres have ~0.27 m of clearance and are left
+alone. Large nudges in the log mean calibrate_arena needs re-running.
 
-Start heading: after --start, if the scan shows the robot can pivot safely,
-it turns SETTLE_DEG each way and back so AMCL can lock its heading from the
+Start heading: after --start, if the scan shows the footprint can sweep
++-SETTLE_DEG (plus SETTLE_MARGIN) without touching anything, it turns
+SETTLE_DEG each way and back so AMCL can lock its heading from the
 LiDAR before driving (the placed bearing is only +-45 deg accurate).
 """
 import math
@@ -121,9 +122,11 @@ REAR_STRIP_MARGIN = 0.03   # m added to each side of the rear check strip
 # Start-heading settle: pivot this far each way, then back.
 SETTLE_DEG = 30.0
 SETTLE_TIMEOUT = 8         # s per pivot
+SETTLE_MARGIN = 0.02       # m kept between the swept footprint and the scan
 SCAN_TIMEOUT = 0.5         # s; older scans are not trusted
 # Target nudge (see module docstring).
-SNAP_RADIUS = 0.07         # m; + 0.05 goal tolerance < 0.145 m allowed
+SNAP_RADIUS = 0.03         # m; safety margin only (was 0.07 while the
+                           # arena calibration was ~10 cm off, 2026-10-30)
 SNAP_STEP = 0.01           # m search grid
 SNAP_MIN_GAIN = 0.005      # m; only move for a real clearance gain
 MAP_OCCUPIED = 65          # occupancy value counted as a wall
@@ -282,6 +285,28 @@ class GoLetters(Node):
         return pts
 
     @staticmethod
+    def sweep_clearance(pts, max_angle):
+        """Smallest gap (m) between the scan and the footprint while it
+        pivots from -max_angle to +max_angle, and the scan point that sets
+        it (x, y in base_link)."""
+        n = max(int(math.degrees(max_angle) / 5.0), 1)
+        angles = [max_angle * (k / n) for k in range(-n, n + 1)]
+        trig = [(math.cos(a), math.sin(a)) for a in angles]
+        best, nearest = float('inf'), None
+        for x, y in pts:
+            if math.hypot(x, y) > PIVOT_RADIUS + 0.5:
+                continue
+            for c, s in trig:
+                # The point in the rotated footprint's frame.
+                u, v = c * x + s * y, -s * x + c * y
+                du = max(-FOOT_BACK - u, 0.0, u - FOOT_FRONT)
+                dv = max(-FOOT_HALF_WIDTH - v, 0.0, v - FOOT_HALF_WIDTH)
+                d = math.hypot(du, dv)
+                if d < best:
+                    best, nearest = d, (x, y)
+        return best, nearest
+
+    @staticmethod
     def pivot_is_clear(pts):
         limit = PIVOT_RADIUS + PIVOT_MARGIN
         return all(math.hypot(x, y) > limit for x, y in pts)
@@ -366,9 +391,18 @@ class GoLetters(Node):
             if pts is not None:
                 break
             rclpy.spin_once(self, timeout_sec=0.05)
-        if pts is None or not self.pivot_is_clear(pts):
-            self.get_logger().info('not enough room to pivot at the start; '
-                                   'skipping heading settle')
+        if pts is None:
+            self.get_logger().info('no fresh scan; skipping heading settle')
+            return
+        gap, nearest = self.sweep_clearance(pts, math.radians(SETTLE_DEG))
+        if gap < SETTLE_MARGIN:
+            x, y = nearest
+            self.get_logger().info(
+                f'not enough room to pivot +-{SETTLE_DEG:.0f} deg at the '
+                f'start (gap {gap * 100:.1f} cm < {SETTLE_MARGIN * 100:.0f} '
+                f'cm; nearest scan point {math.hypot(x, y):.2f} m at '
+                f'{math.degrees(math.atan2(y, x)):+.0f} deg, 0 = ahead, '
+                f'+ = left); skipping heading settle')
             return
         self.get_logger().info(
             f'settling start heading: pivoting +-{SETTLE_DEG:.0f} deg')

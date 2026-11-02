@@ -10,7 +10,7 @@
 # wait for "done". Everything is saved to ~/debug_runs/<label>_<time>/:
 #     system.txt   clock, CPU/RAM, serial ports, udev rules, nodes/topics
 #     top.txt      CPU usage per process, every second
-#     bag/         rosbag of TF, odometry, IMU, scan, AMCL, plan, all
+#     bag/         rosbag of TF, odometry, IMU, scan, AMCL, plan, costmaps, all
 #                  velocity-chain stages, debug topics, diagnostics, /rosout
 #     log_*/       the three most recent ROS launch log folders
 #
@@ -62,6 +62,8 @@ ros2 bag record -o "$RUN/bag" \
     /cmd_vel_nav_raw /cmd_vel_nav_smoothed /cmd_vel_safe /cmd_vel_repelled /cmd_vel \
     /collision_monitor_state \
     /turn_rate_controller/debug /wall_repulsion/debug \
+    /global_costmap/costmap /global_costmap/costmap_updates \
+    /local_costmap/costmap /local_costmap/costmap_updates \
     /diagnostics /rosout
 
 trap - INT
