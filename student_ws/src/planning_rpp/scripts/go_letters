@@ -7,7 +7,7 @@ Usage:
     ros2 run planning_rpp go_letters --start S NE        # only set the pose
 
 --start S0 B0 sets AMCL's initial pose (replacing RViz's 2D Pose Estimate)
-to the centre of square S0 facing bearing B0, one of
+to square S0's target facing bearing B0, one of
 N NE E SE S SW W NW (course directions, N = towards row A-F).
 
 Squares are 60 cm cubes laid out as:
@@ -17,12 +17,14 @@ Squares are 60 cm cubes laid out as:
     M N O P Q R
     S T U V W X     (south)
 
-Centres are expressed in the 'arena' frame (origin at the SW inner corner,
-X = East, Y = North) published by planning.launch.py and transformed into the
-map frame. Squares are sent to Nav2's navigate_to_pose one at a time, with a
-PAUSE_TIME stop at each. If a square fails (e.g. the planner reports "Start
-occupied" because the robot ended up against a wall, which Nav2's default
-behaviour tree does not recover from), the robot backs up BACKUP_DIST with
+Each square's target (map frame) is read from COURSE_FILE
+(maps/rb3302_map_arena.yaml), where the course grid was fitted once to the
+map's walls and each target centred between its walls; see that file's
+header. The start bearing uses the file's arena_yaw. Squares are sent to
+Nav2's navigate_to_pose one at a time, with a PAUSE_TIME stop at each. If a
+square fails (e.g. the planner reports "Start occupied" because the robot
+ended up against a wall, which Nav2's default behaviour tree does not recover
+from), the robot backs up BACKUP_DIST with
 Nav2's backup behaviour and retries, up to ATTEMPTS times, before skipping
 that square.
 
@@ -33,17 +35,13 @@ the robot, it reverses (at most BACKOUT_MAX, keeping BACKOUT_MARGIN from
 whatever is behind) so the turn happens with more room. Otherwise it simply
 pivots as usual.
 
-Targets: each square centre is nudged up to SNAP_RADIUS to the most open
-point on the map (furthest from any wall), only as a safety margin: with a
-correct arena calibration the centres have ~0.27 m of clearance and are left
-alone. Large nudges in the log mean calibrate_arena needs re-running.
-
 Start heading: after --start, if the scan shows the footprint can sweep
 +-SETTLE_DEG (plus SETTLE_MARGIN) without touching anything, it turns
 SETTLE_DEG each way and back so AMCL can lock its heading from the
 LiDAR before driving (the placed bearing is only +-45 deg accurate).
 """
 import math
+import os
 import signal
 import sys
 
@@ -55,9 +53,8 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from rclpy.utilities import remove_ros_args
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
-from nav_msgs.msg import OccupancyGrid, Odometry
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-import numpy as np
+from nav_msgs.msg import Odometry
+import yaml
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from action_msgs.msg import GoalStatus
@@ -68,11 +65,14 @@ from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformListener
 
-CELL_SIZE = 0.6
 ROWS = ['ABCDEF', 'GHIJKL', 'MNOPQR', 'STUVWX']  # north to south
-ARENA_FRAME = 'arena'
 MAP_FRAME = 'map'
-# Arena yaw (X = East) of each course bearing.
+# Fitted course grid + per-square targets (see the file's header).
+# RB3302_COURSE_FILE overrides the path.
+COURSE_FILE = os.environ.get('RB3302_COURSE_FILE', os.path.join(
+    os.path.expanduser('~'), 'rb3302_final_proj_code', 'student_ws', 'maps',
+    'rb3302_map_arena.yaml'))
+# Course-frame yaw (X = East) of each course bearing.
 BEARINGS = {
     'E': 0.0, 'NE': 45.0, 'N': 90.0, 'NW': 135.0,
     'W': 180.0, 'SW': -135.0, 'S': -90.0, 'SE': -45.0,
@@ -124,26 +124,32 @@ SETTLE_DEG = 30.0
 SETTLE_TIMEOUT = 8         # s per pivot
 SETTLE_MARGIN = 0.02       # m kept between the swept footprint and the scan
 SCAN_TIMEOUT = 0.5         # s; older scans are not trusted
-# Target nudge (see module docstring).
-SNAP_RADIUS = 0.03         # m; safety margin only (was 0.07 while the
-                           # arena calibration was ~10 cm off, 2026-10-30)
-SNAP_STEP = 0.01           # m search grid
-SNAP_MIN_GAIN = 0.005      # m; only move for a real clearance gain
-MAP_OCCUPIED = 65          # occupancy value counted as a wall
 
 
 class StopRequested(Exception):
     """Ctrl+C / kill while a Nav2 goal was active (already cancelled)."""
 
 
-def letter_to_arena(letter):
-    """Return the (x, y) centre of a square in the arena frame."""
-    for i, row in enumerate(ROWS):
-        col = row.find(letter)
-        if col >= 0:
-            return ((col + 0.5) * CELL_SIZE,
-                    (len(ROWS) - 1 - i + 0.5) * CELL_SIZE)
-    raise ValueError(f'unknown square {letter!r}; use A-X')
+def load_course(path=COURSE_FILE):
+    """Return ({letter: (x, y)} map-frame targets, course yaw) from the
+    fitted course file."""
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        targets = {k: (float(v[0]), float(v[1]))
+                   for k, v in data['targets'].items()}
+        yaw = float(data['arena_yaw'])
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as e:
+        raise RuntimeError(f'cannot read course targets from {path}: {e}')
+    missing = [c for row in ROWS for c in row if c not in targets]
+    if missing:
+        raise RuntimeError(f'{path} has no target for {" ".join(missing)}')
+    return targets, yaw
+
+
+def check_letter(letter):
+    if len(letter) != 1 or not any(letter in row for row in ROWS):
+        raise ValueError(f'unknown square {letter!r}; use A-X')
 
 
 def bearing_to_arena(bearing):
@@ -176,11 +182,8 @@ class GoLetters(Node):
         self.laser_tf = None
         self.create_subscription(LaserScan, 'scan', self.on_scan,
                                  qos_profile_sensor_data)
-        self.map = None
-        self.create_subscription(
-            OccupancyGrid, 'map', self.on_map,
-            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                       reliability=ReliabilityPolicy.RELIABLE))
+        self.targets, self.course_yaw = load_course()
+        self.get_logger().info(f'course targets from {COURSE_FILE}')
         self.initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, 'initialpose', 10)
         self.nomotion_client = self.create_client(
@@ -203,47 +206,6 @@ class GoLetters(Node):
         self.create_subscription(Twist, 'cmd_vel', self.on_cmd_vel, 10)
         self.create_subscription(Odometry, 'odom', self.on_odom, 10)
         self.status_timer = None
-
-    def on_map(self, msg):
-        self.map = msg
-
-    def wall_cells(self):
-        """Map-frame (x, y) of every occupied cell. Unknown cells are not
-        walls to the planner (allow_unknown), so they are not counted."""
-        m = self.map
-        w, h = m.info.width, m.info.height
-        grid = np.array(m.data, dtype=np.int16).reshape(h, w)
-        rows, cols = np.nonzero(grid >= MAP_OCCUPIED)
-        res = m.info.resolution
-        # Cell centres; the map origin has no rotation in map_server maps.
-        xs = m.info.origin.position.x + (cols + 0.5) * res
-        ys = m.info.origin.position.y + (rows + 0.5) * res
-        return np.column_stack((xs, ys))
-
-    def snap_target(self, letter, x, y, walls):
-        """Most open point within SNAP_RADIUS of (x, y)."""
-        near = walls[(np.abs(walls[:, 0] - x) < 0.6) &
-                     (np.abs(walls[:, 1] - y) < 0.6)]
-        if len(near) == 0:
-            return x, y
-        steps = np.arange(-SNAP_RADIUS, SNAP_RADIUS + 1e-9, SNAP_STEP)
-        dx, dy = np.meshgrid(steps, steps)
-        keep = np.hypot(dx, dy) <= SNAP_RADIUS + 1e-9
-        cx = x + dx[keep]
-        cy = y + dy[keep]
-        # Clearance of each candidate = distance to its nearest wall cell.
-        d = np.sqrt(((cx[:, None] - near[None, :, 0]) ** 2) +
-                    ((cy[:, None] - near[None, :, 1]) ** 2)).min(axis=1)
-        here = np.sqrt(((x - near[:, 0]) ** 2) + ((y - near[:, 1]) ** 2)).min()
-        best = int(np.argmax(d))
-        if d[best] < here + SNAP_MIN_GAIN:
-            return x, y
-        nx, ny = float(cx[best]), float(cy[best])
-        self.get_logger().info(
-            f'{letter}: target nudged {math.hypot(nx - x, ny - y) * 100:.0f} '
-            f'cm to the most open spot; wall clearance {here:.2f} -> '
-            f'{d[best]:.2f} m')
-        return nx, ny
 
     def on_scan(self, msg):
         self.scan = msg
@@ -546,33 +508,10 @@ class GoLetters(Node):
                 warned = True
             self.sleep(0.5)
 
-    def arena_to_map(self):
-        """Wait for map->arena and return (tx, ty, yaw) of arena in map."""
-        deadline = self.get_clock().now() + Duration(seconds=10.0)
-        while rclpy.ok():
-            try:
-                t = self.tf_buffer.lookup_transform(
-                    MAP_FRAME, ARENA_FRAME, Time())
-                return (t.transform.translation.x, t.transform.translation.y,
-                        yaw_of(t.transform.rotation))
-            except Exception as e:  # noqa: BLE001 - keep waiting for TF
-                if self.get_clock().now() > deadline:
-                    raise RuntimeError(
-                        f'no {MAP_FRAME}->{ARENA_FRAME} transform; '
-                        'is planning.launch.py running?') from e
-                rclpy.spin_once(self, timeout_sec=0.1)
-
-    @staticmethod
-    def to_map(arena_tf, x, y):
-        tx, ty, a = arena_tf
-        return (tx + x * math.cos(a) - y * math.sin(a),
-                ty + x * math.sin(a) + y * math.cos(a))
-
     def set_start(self, square, bearing):
         """Give AMCL the start pose, then let it settle on the scan."""
-        arena_tf = self.arena_to_map()
-        x, y = self.to_map(arena_tf, *letter_to_arena(square))
-        yaw = bearing_to_arena(bearing) + arena_tf[2]
+        x, y = self.targets[square]
+        yaw = bearing_to_arena(bearing) + self.course_yaw
 
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = MAP_FRAME
@@ -623,20 +562,7 @@ class GoLetters(Node):
             self.sleep(0.1)
 
     def build_poses(self, letters):
-        arena_tf = self.arena_to_map()
-        points = [self.to_map(arena_tf, *letter_to_arena(letter))
-                  for letter in letters]
-        # Wait briefly for the (latched) map, then nudge each target off the
-        # walls.
-        end = self.get_clock().now() + Duration(seconds=5.0)
-        while self.map is None and self.get_clock().now() < end:
-            rclpy.spin_once(self, timeout_sec=0.1)
-        if self.map is None:
-            self.get_logger().warn('no /map received; using square centres')
-        else:
-            walls = self.wall_cells()
-            points = [self.snap_target(letter, x, y, walls)
-                      for letter, (x, y) in zip(letters, points)]
+        points = [self.targets[letter] for letter in letters]
 
         poses = []
         heading = 0.0
@@ -785,9 +711,9 @@ def main():
         return 1
     try:
         for letter in letters:
-            letter_to_arena(letter)
+            check_letter(letter)
         if start is not None:
-            letter_to_arena(start[0])
+            check_letter(start[0])
             bearing_to_arena(start[1])
     except ValueError as e:
         print(e)

@@ -12,9 +12,10 @@ from launch_ros.descriptions import ParameterFile
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
 
-# Hand-fitted map->arena for rb3302_map, used when there is no calibration
-# file (see calibrate_arena).
-FALLBACK_ARENA = {'arena_x': 0.380, 'arena_y': 1.643, 'arena_yaw': -2.031}
+# map->arena for rb3302_map (the grid fitted to its walls, 2026-11-05), used
+# when <map>_arena.yaml is missing. The frame is for RViz: go_letters reads
+# its targets from that file directly.
+FALLBACK_ARENA = {'arena_x': 0.3682, 'arena_y': 1.6142, 'arena_yaw': -2.0320}
 
 
 def arena_tf(context):
@@ -192,9 +193,9 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_pose_y', default_value='0.0'),
         DeclareLaunchArgument('initial_pose_yaw', default_value='0.0'),
         # Arena frame: origin at the SW inner corner of the 4x6 course (outer
-        # corner of square S), X = East (A->F), Y = North (S->A). Measured by
-        # calibrate_arena into <map>_arena.yaml next to the map; arena_x/y/yaw
-        # override it.
+        # corner of square S), X = East (A->F), Y = North (S->A). Read from
+        # <map>_arena.yaml next to the map (fitted to the map's walls);
+        # arena_x/y/yaw override it.
         DeclareLaunchArgument('arena_frame', default_value='arena'),
         DeclareLaunchArgument(
             'arena_file', default_value='',

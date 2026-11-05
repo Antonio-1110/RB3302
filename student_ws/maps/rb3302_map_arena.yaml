@@ -1,9 +1,44 @@
-# map->arena transform, written by calibrate_arena from squares S F X.
-# Loaded by planning.launch.py; re-run after rebuilding the map.
-# 2026-10-30: shifted 9.7 cm south by hand. The S/F/X fit was done facing N
-# with the old URDF (LiDAR at -0.052 instead of +0.045), which put every
-# pose 9.7 cm ahead. Was x 0.4853, y 1.5557. Re-run calibrate_arena to
-# replace this.
-arena_x: 0.3993
-arena_y: 1.6006
-arena_yaw: -2.0519
+# Course grid fitted to the walls of rb3302_map.pgm (2026-11-05), once.
+#
+# 1. Grid: origin (SW inner corner), yaw and square size per axis fitted by
+#    robust least squares so the map's 697 wall cells lie on the course's
+#    grid lines (median wall-to-line error 2.8 -> 2.4 cm). Squares come out
+#    0.601 m (E-W) x 0.595 m (N-S).
+# 2. Targets: each square centre on that grid, then moved to halfway
+#    between its two walls on any axis with walls on both sides (at most
+#    8 cm; largest: K 7.0 cm, J 3.7 cm, W 2.7 cm). Axes with an open side
+#    keep the grid centre.
+#
+# go_letters drives to `targets` (map frame, m) and uses arena_yaw for the
+# start bearing; planning.launch.py publishes map->arena from arena_x/y/yaw
+# (for RViz). Tied to this map: refit if the map is rebuilt or edited.
+arena_x: 0.3682
+arena_y: 1.6142
+arena_yaw: -2.0320
+cell_x: 0.6009
+cell_y: 0.5951
+targets:
+  A: [2.100, 0.418]
+  B: [1.823, -0.116]
+  C: [1.565, -0.658]
+  D: [1.298, -1.196]
+  E: [1.012, -1.725]
+  F: [0.763, -2.272]
+  G: [1.559, 0.667]
+  H: [1.299, 0.145]
+  I: [1.032, -0.393]
+  J: [0.781, -0.898]
+  K: [0.528, -1.407]
+  L: [0.242, -1.983]
+  M: [1.034, 0.948]
+  N: [0.773, 0.406]
+  O: [0.499, -0.128]
+  P: [0.229, -0.665]
+  Q: [-0.036, -1.205]
+  R: [-0.303, -1.743]
+  S: [0.501, 1.213]
+  T: [0.249, 0.667]
+  U: [-0.034, 0.136]
+  V: [-0.297, -0.404]
+  W: [-0.544, -0.952]
+  X: [-0.836, -1.478]

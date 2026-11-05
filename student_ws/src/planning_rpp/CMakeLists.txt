@@ -9,7 +9,7 @@ install(
 )
 
 install(
-  PROGRAMS scripts/go_letters scripts/stiction_boost scripts/calibrate_arena
+  PROGRAMS scripts/go_letters scripts/stiction_boost
     scripts/turn_rate_controller scripts/calibrate_turning
     scripts/odom_direction_fix scripts/wall_repulsion
   DESTINATION lib/${PROJECT_NAME}
