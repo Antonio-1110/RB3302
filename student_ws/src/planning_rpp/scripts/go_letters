@@ -26,7 +26,9 @@ square fails (e.g. the planner reports "Start occupied" because the robot
 ended up against a wall, which Nav2's default behaviour tree does not recover
 from), the robot backs up BACKUP_DIST with
 Nav2's backup behaviour and retries, up to ATTEMPTS times, before skipping
-that square.
+that square. If a square is not reached within WAYPOINT_TIMEOUT of setting
+off for it (retries and back-ups included), the goal is cancelled and that
+square is skipped.
 
 Leaving tight squares: before each leg the path is planned first. If it
 leaves behind the robot (> EXIT_BEHIND_DEG off its heading) AND the live scan
@@ -102,6 +104,9 @@ ATTEMPTS = 3
 BACKUP_DIST = 0.10
 BACKUP_SPEED = 0.12
 BACKUP_TIMEOUT = 5
+# Time allowed to reach each square (s), counted from setting off for it and
+# including retries; past it the goal is cancelled and the square skipped.
+WAYPOINT_TIMEOUT = 60.0
 
 
 # Robot footprint half-extents (m), as in nav2_params.yaml, and the radius
@@ -128,6 +133,10 @@ SCAN_TIMEOUT = 0.5         # s; older scans are not trusted
 
 class StopRequested(Exception):
     """Ctrl+C / kill while a Nav2 goal was active (already cancelled)."""
+
+
+class WaypointTimeout(Exception):
+    """A square was not reached within WAYPOINT_TIMEOUT (goal cancelled)."""
 
 
 def load_course(path=COURSE_FILE):
@@ -199,6 +208,9 @@ class GoLetters(Node):
         # it and cancel the goal. (Raising KeyboardInterrupt inside rclpy's
         # spin instead leaves the executor broken, so the cancel fails.)
         self.stop_requested = False
+        # When the current square must be reached by (see WAYPOINT_TIMEOUT);
+        # None outside a leg. The wait loops cancel the goal once it passes.
+        self.deadline = None
         # Live printout while driving: commanded vs measured velocity.
         self.cmd = None        # last /cmd_vel sent to the base
         self.odom = None       # last /odom (EKF) twist
@@ -405,12 +417,26 @@ class GoLetters(Node):
         self.get_logger().info(f'-> {self.target} | {cmd} | {act}')
 
     def wait_future(self, future):
-        """Spin until `future` is done; False if a stop was requested."""
+        """Spin until `future` is done; False if a stop was requested or the
+        square's deadline passed."""
         while not future.done():
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self.stop_requested:
+            if self.stop_requested or self.deadline_passed():
                 return False
         return True
+
+    def deadline_passed(self):
+        return (self.deadline is not None and
+                self.get_clock().now() > self.deadline)
+
+    def abort_goal(self):
+        """Cancel the active goal, then raise StopRequested or
+        WaypointTimeout, whichever ended the wait."""
+        self.cancel_active_goal()
+        self.send_future = None
+        if self.stop_requested:
+            raise StopRequested
+        raise WaypointTimeout
 
     def on_signal(self, signum, frame):
         if self.send_future is not None and not self.stop_requested:
@@ -589,23 +615,20 @@ class GoLetters(Node):
 
     def run_action(self, client, goal):
         """Send `goal`, wait for the result and return its GoalStatus
-        (STATUS_ABORTED if rejected). Raises StopRequested, after cancelling
-        the goal, if Ctrl+C / kill arrives meanwhile."""
+        (STATUS_ABORTED if rejected). Raises StopRequested if Ctrl+C / kill
+        arrives meanwhile, or WaypointTimeout if the square's deadline
+        passes, after cancelling the goal."""
         send = client.send_goal_async(goal)
         self.send_future = send
         if not self.wait_future(send):
-            self.cancel_active_goal()
-            self.send_future = None
-            raise StopRequested
+            self.abort_goal()
         handle = send.result()
         if not handle.accepted:
             self.send_future = None
             return GoalStatus.STATUS_ABORTED
         result = handle.get_result_async()
         if not self.wait_future(result):
-            self.cancel_active_goal()
-            self.send_future = None
-            raise StopRequested
+            self.abort_goal()
         self.send_future = None
         return result.result().status
 
@@ -675,7 +698,20 @@ class GoLetters(Node):
             for i, (letter, pose) in enumerate(zip(letters, poses)):
                 self.get_logger().info(
                     f'heading to {letter} ({i + 1}/{len(letters)})')
-                if self.go_to(letter, pose):
+                self.deadline = self.get_clock().now() + Duration(
+                    seconds=WAYPOINT_TIMEOUT)
+                try:
+                    reached = self.go_to(letter, pose)
+                except WaypointTimeout:
+                    self.get_logger().error(
+                        f'{letter}: not reached within '
+                        f'{WAYPOINT_TIMEOUT:.0f} s, skipping it')
+                    missed.append(letter)
+                    continue
+                finally:
+                    self.deadline = None
+                    self.target = ''
+                if reached:
                     self.get_logger().info(
                         f'reached {letter}; pausing {PAUSE_TIME:.1f} s')
                     self.sleep(PAUSE_TIME)
@@ -689,6 +725,7 @@ class GoLetters(Node):
         finally:
             self.status_timer.cancel()
             self.target = ''
+            self.deadline = None
 
         if missed:
             self.get_logger().warn('missed: ' + ' '.join(missed))
