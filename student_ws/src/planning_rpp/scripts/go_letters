@@ -95,7 +95,7 @@ AMCL_ACTIVE_TIMEOUT = 30.0
 START_POSE_TF_WAIT = 3.0
 START_POSE_ATTEMPTS = 5
 # Stop at each square (s).
-PAUSE_TIME = 3.5
+PAUSE_TIME = 5.0
 # Tries per square; between tries the robot backs up BACKUP_DIST (m) at
 # BACKUP_SPEED (m/s), giving up on the back-up after BACKUP_TIMEOUT (s).
 ATTEMPTS = 3
@@ -120,7 +120,7 @@ BACKOUT_MIN = 0.10         # m; less room than this -> do not back up
 BACKOUT_MARGIN = 0.08      # m kept from the nearest thing behind
 REAR_STRIP_MARGIN = 0.03   # m added to each side of the rear check strip
 # Start-heading settle: pivot this far each way, then back.
-SETTLE_DEG = 30.0
+SETTLE_DEG = 20.0          # was 30; smaller turns, less overshoot
 SETTLE_TIMEOUT = 8         # s per pivot
 SETTLE_MARGIN = 0.02       # m kept between the swept footprint and the scan
 SCAN_TIMEOUT = 0.5         # s; older scans are not trusted

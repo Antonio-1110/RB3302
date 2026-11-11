@@ -102,6 +102,12 @@ def generate_launch_description():
     scan_topic = LaunchConfiguration('scan_topic')
     odom_topic = LaunchConfiguration('odom_topic')
     raw_odom_topic = LaunchConfiguration('raw_odom_topic')
+    scan_confirm = LaunchConfiguration('scan_confirm')
+    # The planner's costmap uses only LiDAR returns several scans agree on
+    # (scan_confirm); the local costmap keeps the raw scan.
+    global_scan_topic = PythonExpression([
+        "'/scan_confirmed' if '", scan_confirm, "'.lower() == 'true' else '",
+        scan_topic, "'"])
     imu_topic = LaunchConfiguration('imu_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     stiction_boost = LaunchConfiguration('stiction_boost')
@@ -138,6 +144,8 @@ def generate_launch_description():
                 'odom_topic': odom_topic,
                 'scan_topic': scan_topic,
                 'topic': scan_topic,
+                'global_costmap.global_costmap.ros__parameters.obstacle_layer'
+                '.scan.topic': global_scan_topic,
             },
             convert_types=True,
         ),
@@ -164,6 +172,10 @@ def generate_launch_description():
         DeclareLaunchArgument('odom_frame', default_value='odom'),
         DeclareLaunchArgument('map_frame', default_value='map'),
         DeclareLaunchArgument('scan_topic', default_value='/scan'),
+        DeclareLaunchArgument(
+            'scan_confirm', default_value='true',
+            description='Global costmap marks only returns seen in 3 of 5 '
+                        'scans, not while turning (false = raw scan)'),
         DeclareLaunchArgument('odom_topic', default_value='/odom'),
         DeclareLaunchArgument('raw_odom_topic', default_value='/odom/raw'),
         DeclareLaunchArgument('imu_topic', default_value='/imu_data_ros'),
@@ -349,6 +361,27 @@ def generate_launch_description():
                 ('cmd_vel_in', repulsion_input_topic),
                 ('cmd_vel_out', 'cmd_vel_repelled'),
                 ('scan', scan_topic),
+            ],
+        ),
+        Node(
+            package='planning_rpp',
+            executable='scan_confirm',
+            name='scan_confirm',
+            output='screen',
+            condition=IfCondition(scan_confirm),
+            # 5 of the last 8 scans (~0.5 s at 10 Hz) must agree before a
+            # return reaches the global costmap (2026-11-06; node default
+            # 3 of 5); max_age 1.5 s so scans skipped while turning do not
+            # leave too few.
+            parameters=[{'use_sim_time': use_sim_time,
+                         'odom_frame': odom_frame,
+                         'window': 8,
+                         'confirm_hits': 5,
+                         'max_age': 1.5}],
+            remappings=[
+                ('scan_in', scan_topic),
+                ('scan_out', '/scan_confirmed'),
+                ('odom', odom_topic),
             ],
         ),
         OpaqueFunction(function=turn_controller_node,

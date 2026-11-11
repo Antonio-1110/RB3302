@@ -55,7 +55,7 @@ trap 'echo; echo "[debug] stopping recording, please wait..."' INT
 echo "[debug] recording. Start go_letters now; press Ctrl+C here ONCE when the run is over."
 ros2 bag record -o "$RUN/bag" \
     /tf /tf_static \
-    /scan \
+    /scan /scan_confirmed /scan_confirm/debug \
     /odom /odom/raw /odom/raw_signed /imu_data_ros \
     /amcl_pose /initialpose \
     /plan /lookahead_point \

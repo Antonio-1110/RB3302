@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Pass on only LiDAR returns that several scans agree on.
+
+Feeds the GLOBAL costmap (the planner's map of obstacles):
+
+    /scan --> scan_confirm --> /scan_confirmed --> global costmap
+
+Why (2026-11-06): the global costmap kept marking short false wall
+segments in free space near T. Nothing is there: real walls were being
+drawn in the wrong place for a moment, by scan distortion while the robot
+turns (one revolution takes 0.1-0.15 s) or by AMCL pose jumps. A
+misplaced point lands somewhere different in every scan, a real obstacle
+in the same place, so:
+
+  1. Each scan's points are put into the odom frame (smooth, no AMCL
+     jumps) on a grid of `cell` metres.
+  2. A return is passed on only if its cell, or a neighbouring cell, was
+     also hit in at least `confirm_hits` - 1 of the previous
+     `window` - 1 scans (default: 3 of the last 5, so a real obstacle
+     appears ~0.3 s after it is first seen at 10 Hz). Scans older than
+     `max_age` seconds do not count.
+  3. While the robot turns faster than `max_turn_rate` (EKF yaw rate),
+     scans are not published and not used as evidence: those are the
+     distorted ones.
+
+Unconfirmed beams are sent as +inf, which the costmap ignores (neither
+marks nor clears), so a stray ray cannot erase a real obstacle either.
+Confirmed beams mark and clear as before. The local costmap (RPP's
+collision check) and wall_repulsion keep the raw /scan.
+
+Watch ~/debug: x = returns in, y = returns passed on, z = 1 while
+skipping for a turn.
+"""
+import math
+from collections import deque
+
+import rclpy
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from geometry_msgs.msg import Vector3
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from tf2_ros import Buffer, TransformListener
+
+NEIGHBOURS = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+
+
+def rotation(q):
+    """First two rows of the rotation matrix of quaternion q."""
+    x, y, z, w = q.x, q.y, q.z, q.w
+    return ((1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+            (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)))
+
+
+class ScanConfirm(Node):
+
+    def __init__(self):
+        super().__init__('scan_confirm')
+        p = self.declare_parameter
+        self.enabled = p('enabled', True).value
+        self.frame = p('odom_frame', 'odom').value
+        self.cell = p('cell', 0.05).value
+        self.window = int(p('window', 5).value)
+        self.confirm_hits = int(p('confirm_hits', 3).value)
+        self.max_age = p('max_age', 1.0).value
+        self.max_turn_rate = p('max_turn_rate', 0.5).value
+        self.odom_timeout = p('odom_timeout', 0.5).value
+        self.tf_timeout = p('tf_timeout', 0.1).value
+
+        self.history = deque(maxlen=max(self.window - 1, 1))  # (t, cells)
+        self.yaw_rate = 0.0
+        self.odom_time = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self,
+                                             spin_thread=True)
+        self.pub = self.create_publisher(LaserScan, 'scan_out',
+                                         qos_profile_sensor_data)
+        self.debug_pub = self.create_publisher(Vector3, '~/debug', 10)
+        self.create_subscription(LaserScan, 'scan_in', self.on_scan,
+                                 qos_profile_sensor_data)
+        self.create_subscription(Odometry, 'odom', self.on_odom, 10)
+        self.get_logger().info(
+            f'scan confirmation {"on" if self.enabled else "off"}: '
+            f'{self.confirm_hits} of {self.window} scans, cell {self.cell} '
+            f'm, skip turns above {self.max_turn_rate} rad/s')
+
+    def on_odom(self, msg):
+        self.yaw_rate = msg.twist.twist.angular.z
+        self.odom_time = self.get_clock().now()
+
+    def turning(self):
+        if self.odom_time is None:
+            return False
+        age = (self.get_clock().now() - self.odom_time).nanoseconds / 1e9
+        return age < self.odom_timeout and abs(self.yaw_rate) > \
+            self.max_turn_rate
+
+    def on_scan(self, msg):
+        if not self.enabled:
+            self.pub.publish(msg)
+            return
+        if self.turning():
+            self.debug_pub.publish(Vector3(x=0.0, y=0.0, z=1.0))
+            return
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.frame, msg.header.frame_id, Time.from_msg(msg.header.stamp),
+                timeout=Duration(seconds=self.tf_timeout))
+        except Exception as e:  # noqa: BLE001 - tf2 raises several types
+            self.get_logger().warn(f'no {self.frame} <- '
+                                   f'{msg.header.frame_id}: {e}',
+                                   throttle_duration_sec=2.0)
+            return
+        r0, r1 = rotation(t.transform.rotation)
+        tx, ty = t.transform.translation.x, t.transform.translation.y
+        cell = self.cell
+        cells = []                       # per beam: cell or None
+        angle = msg.angle_min
+        for r in msg.ranges:
+            a = angle
+            angle += msg.angle_increment
+            if not (msg.range_min <= r <= msg.range_max) or math.isinf(r):
+                cells.append(None)
+                continue
+            lx, ly = r * math.cos(a), r * math.sin(a)
+            x = r0[0] * lx + r0[1] * ly + tx
+            y = r1[0] * lx + r1[1] * ly + ty
+            cells.append((math.floor(x / cell), math.floor(y / cell)))
+
+        now = Time.from_msg(msg.header.stamp).nanoseconds / 1e9
+        past = [c for ts, c in self.history if now - ts <= self.max_age]
+        need = self.confirm_hits - 1
+        out = LaserScan()
+        out.header = msg.header
+        out.angle_min, out.angle_max = msg.angle_min, msg.angle_max
+        out.angle_increment = msg.angle_increment
+        out.time_increment, out.scan_time = msg.time_increment, msg.scan_time
+        out.range_min, out.range_max = msg.range_min, msg.range_max
+        out.intensities = msg.intensities
+        ranges = list(msg.ranges)
+        hits = passed = 0
+        for i, c in enumerate(cells):
+            if c is None:
+                continue
+            hits += 1
+            seen = 0
+            for prev in past:
+                if any((c[0] + dx, c[1] + dy) in prev for dx, dy in NEIGHBOURS):
+                    seen += 1
+                    if seen >= need:
+                        break
+            if seen >= need:
+                passed += 1
+            else:
+                ranges[i] = math.inf
+        out.ranges = ranges
+        self.history.append((now, {c for c in cells if c is not None}))
+        self.pub.publish(out)
+        self.debug_pub.publish(Vector3(x=float(hits), y=float(passed), z=0.0))
+
+
+def main():
+    rclpy.init()
+    node = ScanConfirm()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()
